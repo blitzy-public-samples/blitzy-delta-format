@@ -1,0 +1,30 @@
+# ---------------------------------------------------------------------------
+# validate/ — dev/test dependencies for the parity (Gate 1) & security (Gate 5)
+# acceptance harness. Dev/test ONLY: does not affect the monorepo build or the
+# Glue runtime (Glue resolves delta-spark from ARTIFACT_S3_BUCKET).
+# Run: pytest validate/test_parity.py --env <env>
+# ---------------------------------------------------------------------------
+
+# Test runner (Gate 1 parity + Gate 5 security). Pin to team standard.
+pytest>=7.0.0
+
+# AWS SDK for Gate 5 (iam simulate-principal-policy, IAM policy fetch),
+# DynamoDB scan, and S3 _delta_log listing. Runtime-provided in Glue/MWAA;
+# required locally for the harness. Confirm exact pin with platform team.
+boto3>=1.26.0
+
+# Delta Lake Python API (DeltaTable). AUTHORITATIVE exact pin per AAP §0.3.1.
+delta-spark==3.2.0
+
+# Apache Spark Python API used to read the deployed Delta output tables and
+# compute the 5-field parity hash.
+#
+# COMPATIBILITY OPEN ITEM (AAP §0.3.3): delta-spark 3.2.0 is published against
+# the Spark 3.5.x line, while AWS Glue 4.0 ships Spark 3.3.x. For faithful
+# parity against the DEPLOYED tables, align pyspark with the Glue 4.0 runtime
+# (Spark 3.3.x). CONFIRM the exact compatible (pyspark, delta-spark) pair with
+# the platform team before production cutover; do not assume.
+pyspark>=3.3.0,<3.6.0
+
+# YAML parser for config/pipeline_manifest.yaml (table catalog + parity specs).
+pyyaml>=6.0
