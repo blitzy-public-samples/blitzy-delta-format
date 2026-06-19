@@ -113,6 +113,12 @@ bytes and reconciled with the upstream source.
   recompilation.
 - **No invented data** — checksums are `<sha256>` placeholders to be filled at
   staging time, and no download URLs are fabricated.
-- **Purely additive** — no existing monorepo file is modified (Minimal Change
-  Mandate).
+- **Minimal Change Mandate honored** — no **pre-existing** delta-io/delta monorepo
+  source, build, or metadata file (e.g. anything under `spark*/`, `kernel*/`,
+  `storage*/`, `build.sbt`, `setup.py`, `version.sbt`) is modified. Everything this
+  feature delivers — including this `artifacts/` directory and this README — is a
+  **net-new feature deliverable**. As a living provenance document, this README is
+  authored and **refined across checkpoints** (created in CP1, updated in later
+  checkpoints); such updates are confined to net-new feature files and therefore
+  remain fully within the Mandate.
 - **No secrets** are recorded in this directory.

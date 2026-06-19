@@ -92,6 +92,7 @@ from lib.delta_io import count_rows, overwrite_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
+from lib.s3_paths import build_delta_table_uri, build_quarantine_uri
 from lib.schema_validation import (
     enforce_bad_record_threshold,
     quarantine_bad_records,
@@ -125,12 +126,19 @@ def _resolve_glue_run_id() -> str:
         run_id = resolved.get("JOB_RUN_ID", "")
         if run_id:
             return run_id
-    except Exception:
+    except Exception as exc:
         # Best-effort only: the run id is a non-essential log field, so any
         # failure to resolve it (for example ``awsglue`` being unavailable in a
         # local / test context) must NOT fail the job. This handler does not
         # guard any Delta / DynamoDB operation, so it preserves ACID strictness.
-        pass
+        # Record the benign reason at debug level (no no-op ``pass``) and fall
+        # through to the environment / literal fallback below.
+        get_logger("stage_0_ingest").debug(
+            "Glue run id unresolved via resolve_options (%s: %s); falling back "
+            "to the JOB_RUN_ID environment variable or 'unknown'.",
+            type(exc).__name__,
+            exc,
+        )
     return os.environ.get("JOB_RUN_ID", "") or "unknown"
 
 
@@ -173,24 +181,32 @@ def _resolve_table(manifest: Manifest, name: str) -> dict:
 
 
 def _delta_path(delta_bucket: str, defaults: dict, table: dict) -> str:
-    """Compose the fully qualified ``s3a://`` Delta table location.
+    """Compose the fully qualified, validated ``s3a://`` Delta table location.
 
-    Built as ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}``
-    with defensive slash-stripping so stray separators in the manifest never
-    produce a doubled ``//``. ``delta_bucket`` is the scheme-less DELTA_S3_BUCKET
-    job arg; the prefix and per-table path are relative, env-agnostic manifest
-    values, keeping this composition portable across dev / nonprod / prod.
+    Delegates to :func:`lib.s3_paths.build_delta_table_uri`, which composes
+    ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}`` and
+    centrally validates every piece: the bucket is checked against S3 naming
+    rules (rejecting embedded schemes, slashes, backslashes, ``..`` and control
+    characters), and the prefix / per-table path segments reject traversal
+    tokens, embedded schemes, backslashes, control characters and empty /
+    absolute segments (CWE-22 hardening). For legitimate manifest values the
+    output is byte-identical to the prior slash-stripping composition, so the
+    Delta layout is unchanged. ``delta_bucket`` is the scheme-less
+    DELTA_S3_BUCKET job arg; the prefix and per-table path are relative,
+    env-agnostic manifest values, keeping this composition portable across
+    dev / nonprod / prod.
 
     :param delta_bucket: Destination bucket name, without an ``s3a://`` scheme.
     :param defaults: The manifest ``defaults`` mapping (uses ``delta_path_prefix``).
     :param table: The resolved table mapping (uses its relative ``path``).
-    :returns: The fully qualified ``s3a://`` location of the Delta table.
+    :returns: The fully qualified, validated ``s3a://`` location of the Delta table.
+    :raises lib.s3_paths.S3PathError: If the bucket or any path segment is unsafe.
     """
-    bucket = delta_bucket.strip().strip("/")
-    prefix = str(defaults.get("delta_path_prefix", "")).strip("/")
-    rel_path = str(table.get("path", "")).strip("/")
-    segments = [segment for segment in (prefix, rel_path) if segment]
-    return f"s3a://{bucket}/" + "/".join(segments)
+    return build_delta_table_uri(
+        delta_bucket,
+        str(defaults.get("delta_path_prefix", "")),
+        str(table.get("path", "")),
+    )
 
 
 def _string_read_schema(columns: list[str], corrupt_column: str = _CORRUPT_COLUMN) -> StructType:
@@ -273,11 +289,16 @@ def main() -> None:
         # manifest-driven; the column list itself is never hardcoded here.
         typed_schema = get_schema(out_table_name)
 
-        # --- Run-scoped quarantine path: <root>/<table>[/<run_date>].
-        quarantine_path = f'{args["quarantine_s3_path"].rstrip("/")}/{out_table_name}'
+        # --- Run-scoped quarantine path: <root>/<table>[/<run_date>], built and
+        # validated centrally. ``build_quarantine_uri`` parses the quarantine
+        # root as an s3a/s3 URI, validates ``out_table_name`` as a single
+        # slash-free key component, and validates ``run_date`` as a strict
+        # ``YYYY-MM-DD`` calendar date before appending it -- so an unsafe or
+        # traversal run_date can never smuggle extra path levels (CWE-22).
         run_date = args.get("run_date", "")
-        if run_date:
-            quarantine_path = f"{quarantine_path}/{run_date}"
+        quarantine_path = build_quarantine_uri(
+            args["quarantine_s3_path"], out_table_name, run_date
+        )
 
         threshold = float(args["bad_record_threshold"])
 

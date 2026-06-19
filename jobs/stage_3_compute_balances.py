@@ -126,6 +126,7 @@ from lib.delta_io import count_rows, read_delta, write_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
+from lib.s3_paths import build_delta_table_uri
 from lib.spark_session import build_spark_session
 from schemas import get_schema
 
@@ -166,12 +167,19 @@ def _resolve_glue_run_id() -> str:
         run_id = resolved.get("JOB_RUN_ID", "")
         if run_id:
             return run_id
-    except Exception:
+    except Exception as exc:
         # Best-effort only: the run id is a non-essential log field, so any
         # failure to resolve it (for example ``awsglue`` being unavailable in a
         # local / test context) must NOT fail the job. This handler does not
         # guard any Delta / DynamoDB operation, so it preserves ACID strictness.
-        pass
+        # Record the benign reason at debug level (no no-op ``pass``) and fall
+        # through to the environment / literal fallback below.
+        get_logger("stage_3_compute_balances").debug(
+            "Glue run id unresolved via resolve_options (%s: %s); falling back "
+            "to the JOB_RUN_ID environment variable or 'unknown'.",
+            type(exc).__name__,
+            exc,
+        )
     return os.environ.get("JOB_RUN_ID", "") or "unknown"
 
 
@@ -214,24 +222,32 @@ def _resolve_table(manifest: Manifest, name: str) -> dict:
 
 
 def _delta_path(delta_bucket: str, defaults: dict, table: dict) -> str:
-    """Compose the fully qualified ``s3a://`` Delta table location.
+    """Compose the fully qualified, validated ``s3a://`` Delta table location.
 
-    Built as ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}``
-    with defensive slash-stripping so stray separators in the manifest never
-    produce a doubled ``//``. ``delta_bucket`` is the scheme-less DELTA_S3_BUCKET
-    job arg; the prefix and per-table path are relative, env-agnostic manifest
-    values, keeping this composition portable across dev / nonprod / prod.
+    Delegates to :func:`lib.s3_paths.build_delta_table_uri`, which composes
+    ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}`` and
+    centrally validates every piece: the bucket is checked against S3 naming
+    rules (rejecting embedded schemes, slashes, backslashes, ``..`` and control
+    characters), and the prefix / per-table path segments reject traversal
+    tokens, embedded schemes, backslashes, control characters and empty /
+    absolute segments (CWE-22 hardening). For legitimate manifest values the
+    output is byte-identical to the prior slash-stripping composition, so the
+    Delta layout is unchanged. ``delta_bucket`` is the scheme-less
+    DELTA_S3_BUCKET job arg; the prefix and per-table path are relative,
+    env-agnostic manifest values, keeping this composition portable across
+    dev / nonprod / prod.
 
     :param delta_bucket: Destination bucket name, without an ``s3a://`` scheme.
     :param defaults: The manifest ``defaults`` mapping (uses ``delta_path_prefix``).
     :param table: The resolved table mapping (uses its relative ``path``).
-    :returns: The fully qualified ``s3a://`` location of the Delta table.
+    :returns: The fully qualified, validated ``s3a://`` location of the Delta table.
+    :raises lib.s3_paths.S3PathError: If the bucket or any path segment is unsafe.
     """
-    bucket = delta_bucket.strip().strip("/")
-    prefix = str(defaults.get("delta_path_prefix", "")).strip("/")
-    rel_path = str(table.get("path", "")).strip("/")
-    segments = [segment for segment in (prefix, rel_path) if segment]
-    return f"s3a://{bucket}/" + "/".join(segments)
+    return build_delta_table_uri(
+        delta_bucket,
+        str(defaults.get("delta_path_prefix", "")),
+        str(table.get("path", "")),
+    )
 
 
 def _conform_to_schema(df: DataFrame, schema: StructType) -> DataFrame:
@@ -272,13 +288,13 @@ def compute_balances(df: DataFrame) -> DataFrame:
     ``[account_id, posting_date, balance_amount, currency_code, cost_center]``,
     which excludes the processing-time ``computed_at`` audit stamp):
 
-    #. **Signed amount** -- per entry, negate ``amount`` when the (Stage-1
-       canonicalized) ``debit_credit_indicator`` is ``"C"`` (a credit) and keep it
-       otherwise (a debit, or an unrecognized / NULL side); the indicator is
-       defensively re-trimmed / upper-cased so a stray spelling cannot leak a wrong
-       sign.
-    #. **Net balance** -- ``balance_amount`` is the group sum of the signed amount,
-       cast explicitly to ``DECIMAL(18, 2)`` so the rolled-up balance is exact.
+    #. **Net balance** -- ``balance_amount`` is the group sum of the upstream
+       ``signed_amount`` column produced by Stage 2 (``dbo.usp_enrich_accounts``),
+       cast explicitly to ``DECIMAL(18, 2)`` so the rolled-up balance is exact. This
+       stage no longer re-derives the per-entry sign: ``signed_amount`` is the single
+       authoritative signed value (Stage 2 already negated credits), so consuming it
+       here removes the prior cross-stage contract drift and guarantees the balance
+       reflects exactly the sign convention emitted upstream.
     #. **Debit / credit subtotals** -- ``debit_amount`` / ``credit_amount`` are the
        group sums of ``amount`` restricted to the explicit ``"D"`` / ``"C"`` side
        respectively, each cast to ``DECIMAL(18, 2)``. A NULL / unknown side belongs
@@ -312,18 +328,21 @@ def compute_balances(df: DataFrame) -> DataFrame:
     """
     money = DecimalType(_MONEY_PRECISION, _MONEY_SCALE)
 
-    # Defensive canonical read of the (already Stage-1-canonicalized) indicator.
-    # ``coalesce(..., lit(False))`` collapses three-valued logic so a NULL indicator
-    # is treated as "not a credit" / "not a debit" rather than propagating NULL into
-    # the sign decision or the subtotal predicates.
+    # Defensive canonical read of the (already Stage-1-canonicalized) indicator,
+    # used ONLY to split the explicit debit / credit subtotals below. The net
+    # balance no longer depends on a locally re-derived sign -- it sums the upstream
+    # ``signed_amount`` column directly. ``coalesce(..., lit(False))`` collapses
+    # three-valued logic so a NULL indicator is treated as "not a credit" / "not a
+    # debit" rather than propagating NULL into the subtotal predicates.
     indicator = F.upper(F.trim(F.col("debit_credit_indicator")))
     is_credit = F.coalesce(indicator == F.lit(_CREDIT_INDICATOR), F.lit(False))
     is_debit = F.coalesce(indicator == F.lit(_DEBIT_INDICATOR), F.lit(False))
 
-    # (1) Signed amount: a credit reduces the running balance; everything else (a
-    #     debit, or an unrecognized / NULL side) keeps the amount positive. This is
-    #     the representative sign convention documented in Stage 2.
-    signed_amount = F.when(is_credit, -F.col("amount")).otherwise(F.col("amount"))
+    # (1) Net balance source: consume the AUTHORITATIVE ``signed_amount`` emitted by
+    #     Stage 2 (a credit is already stored negative there). Summing this column --
+    #     rather than re-deriving the sign here -- removes cross-stage contract drift
+    #     and keeps the sign convention defined in exactly one place (Stage 2).
+    signed_amount = F.col("signed_amount")
     # (3) Explicit-side subtotals: a NULL / unknown indicator contributes to neither
     #     subtotal (Stage 1 maps unknown tokens to NULL rather than guessing a side).
     #     ``when`` with no ``otherwise`` yields NULL off-side, and ``sum`` skips NULLs,

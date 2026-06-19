@@ -100,6 +100,7 @@ from lib.delta_io import count_rows, read_delta, write_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
+from lib.s3_paths import build_delta_table_uri
 from lib.spark_session import build_spark_session
 from schemas import get_schema
 
@@ -139,12 +140,19 @@ def _resolve_glue_run_id() -> str:
         run_id = resolved.get("JOB_RUN_ID", "")
         if run_id:
             return run_id
-    except Exception:
+    except Exception as exc:
         # Best-effort only: the run id is a non-essential log field, so any
         # failure to resolve it (for example ``awsglue`` being unavailable in a
         # local / test context) must NOT fail the job. This handler does not
         # guard any Delta / DynamoDB operation, so it preserves ACID strictness.
-        pass
+        # Record the benign reason at debug level (no no-op ``pass``) and fall
+        # through to the environment / literal fallback below.
+        get_logger("stage_1_cleanse_transactions").debug(
+            "Glue run id unresolved via resolve_options (%s: %s); falling back "
+            "to the JOB_RUN_ID environment variable or 'unknown'.",
+            type(exc).__name__,
+            exc,
+        )
     return os.environ.get("JOB_RUN_ID", "") or "unknown"
 
 
@@ -187,24 +195,32 @@ def _resolve_table(manifest: Manifest, name: str) -> dict:
 
 
 def _delta_path(delta_bucket: str, defaults: dict, table: dict) -> str:
-    """Compose the fully qualified ``s3a://`` Delta table location.
+    """Compose the fully qualified, validated ``s3a://`` Delta table location.
 
-    Built as ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}``
-    with defensive slash-stripping so stray separators in the manifest never
-    produce a doubled ``//``. ``delta_bucket`` is the scheme-less DELTA_S3_BUCKET
-    job arg; the prefix and per-table path are relative, env-agnostic manifest
-    values, keeping this composition portable across dev / nonprod / prod.
+    Delegates to :func:`lib.s3_paths.build_delta_table_uri`, which composes
+    ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}`` and
+    centrally validates every piece: the bucket is checked against S3 naming
+    rules (rejecting embedded schemes, slashes, backslashes, ``..`` and control
+    characters), and the prefix / per-table path segments reject traversal
+    tokens, embedded schemes, backslashes, control characters and empty /
+    absolute segments (CWE-22 hardening). For legitimate manifest values the
+    output is byte-identical to the prior slash-stripping composition, so the
+    Delta layout is unchanged. ``delta_bucket`` is the scheme-less
+    DELTA_S3_BUCKET job arg; the prefix and per-table path are relative,
+    env-agnostic manifest values, keeping this composition portable across
+    dev / nonprod / prod.
 
     :param delta_bucket: Destination bucket name, without an ``s3a://`` scheme.
     :param defaults: The manifest ``defaults`` mapping (uses ``delta_path_prefix``).
     :param table: The resolved table mapping (uses its relative ``path``).
-    :returns: The fully qualified ``s3a://`` location of the Delta table.
+    :returns: The fully qualified, validated ``s3a://`` location of the Delta table.
+    :raises lib.s3_paths.S3PathError: If the bucket or any path segment is unsafe.
     """
-    bucket = delta_bucket.strip().strip("/")
-    prefix = str(defaults.get("delta_path_prefix", "")).strip("/")
-    rel_path = str(table.get("path", "")).strip("/")
-    segments = [segment for segment in (prefix, rel_path) if segment]
-    return f"s3a://{bucket}/" + "/".join(segments)
+    return build_delta_table_uri(
+        delta_bucket,
+        str(defaults.get("delta_path_prefix", "")),
+        str(table.get("path", "")),
+    )
 
 
 def _conform_to_schema(df: DataFrame, schema: StructType) -> DataFrame:
@@ -254,27 +270,36 @@ def cleanse_transactions(df: DataFrame) -> DataFrame:
     #. **Posting date** -- defensively re-cast to an explicit ``DateType``.
     #. **Audit** -- stamp ``cleansed_at`` with the processing-time
        :func:`~pyspark.sql.functions.current_timestamp`.
-    #. **Validity gate** -- drop structurally-invalid rows whose business keys
-       (``gl_entry_id``, ``account_id``, ``posting_date``, ``amount``) are null or
-       blank. Because Stage 0 already validated ``staging_raw`` against its typed,
-       non-nullable schema, this filter removes nothing in normal operation and so
-       preserves row-count parity; it is retained as a defensive guarantee that the
-       target's non-nullable key columns truly hold no nulls. The boolean validity
-       indicator is computed but deliberately NOT emitted, because the authoritative
-       ``staging_1_cleansed`` schema does not declare such a column.
+    #. **Validity indicator** -- derive an ``is_valid`` Boolean column that is
+       ``True`` only when every business key (``gl_entry_id``, ``account_id``,
+       ``posting_date``, ``amount``) is non-null and the string keys are non-blank.
+       Per the SP-replacement contract the indicator is **emitted as a column**
+       (not used as a filter): rows are NOT silently dropped here, so the stage is
+       row-count-preserving by construction and downstream consumers retain the
+       explicit validity flag. The expression is total (each clause is an
+       ``isNotNull`` / ``length`` / ``&`` that yields ``True`` or ``False`` but
+       never ``NULL``), so ``is_valid`` is always populated and conforms to the
+       non-nullable ``staging_1_cleansed.is_valid`` field. Because Stage 0 already
+       validated ``staging_raw`` against its typed, non-nullable schema, in normal
+       operation every row evaluates to ``True``; the column nonetheless makes the
+       validity decision explicit and auditable.
 
     The returned DataFrame carries exactly the columns the ``staging_1_cleansed``
-    schema declares (the ten ``staging_raw`` columns plus ``cleansed_at``);
-    :func:`main` additionally projects it through :func:`_conform_to_schema` to lock
-    the column order and types before the schema-locked Delta write.
+    schema declares (the ten ``staging_raw`` columns plus the derived ``is_valid``
+    Boolean and ``cleansed_at``); :func:`main` additionally projects it through
+    :func:`_conform_to_schema` to lock the column order and types before the
+    schema-locked Delta write.
 
     Reconciliation note: this representative finance template MUST be reconciled 1:1
     with the real ``dbo.usp_cleanse_transactions`` body (including its exact
-    row-retention policy for invalid keys and unrecognized indicators) before
-    production cutover.
+    ``is_valid`` derivation and any row-retention policy for invalid keys and
+    unrecognized indicators) before production cutover. If the legacy procedure
+    physically removes invalid rows rather than flagging them, that exclusion must
+    be applied downstream (or here) to mirror the documented 1:1 behavior.
 
     :param df: The ``staging_raw`` DataFrame (typed per ``schemas.staging_raw``).
-    :returns: The cleansed DataFrame, ready to be conformed to ``staging_1_cleansed``.
+    :returns: The cleansed DataFrame (carrying the ``is_valid`` indicator), ready to
+        be conformed to ``staging_1_cleansed``.
     """
     cleansed = df
 
@@ -303,9 +328,12 @@ def cleanse_transactions(df: DataFrame) -> DataFrame:
     # (6) Stamp the cleanse audit timestamp.
     cleansed = cleansed.withColumn("cleansed_at", F.current_timestamp())
 
-    # (7) Drop structurally-invalid rows (missing business keys). A no-op in normal
-    #     operation because Stage 0 already enforced staging_raw's non-nullable keys;
-    #     retained as a defensive guarantee for the non-nullable target columns.
+    # (7) Derive the is_valid Boolean indicator and EMIT it as a column (do not
+    #     filter). The expression is total -- each clause is an isNotNull / length
+    #     comparison combined with ``&`` -- so it yields True/False but never NULL,
+    #     satisfying the non-nullable staging_1_cleansed.is_valid field. Emitting
+    #     (rather than dropping) keeps the stage row-count-preserving and surfaces
+    #     the validity decision explicitly to downstream stages and parity checks.
     is_valid = (
         F.col("gl_entry_id").isNotNull()
         & (F.length(F.col("gl_entry_id")) > 0)
@@ -314,7 +342,7 @@ def cleanse_transactions(df: DataFrame) -> DataFrame:
         & F.col("posting_date").isNotNull()
         & F.col("amount").isNotNull()
     )
-    return cleansed.where(is_valid)
+    return cleansed.withColumn("is_valid", is_valid)
 
 
 def main() -> None:

@@ -45,12 +45,13 @@ and trivially reconcilable against its real stored procedure.
 Responsibility (in order)
 -------------------------
 #. Read EVERY Delta table named in this stage's manifest ``reads`` list (currently
-   ``staging_3_balances``), keyed by logical table name, so expanding ``reads`` in
-   the manifest adds inputs with no change to this job's control flow.
+   the ENTRY-GRAIN ``staging_2_enriched`` -- one row per GL entry), keyed by logical
+   table name, so expanding ``reads`` in the manifest adds inputs with no change to
+   this job's control flow.
 #. For each table named in this stage's manifest ``writes`` list, invoke the
-   registered builder (the representative 1:1 stored-procedure logic) to produce a
-   DataFrame that conforms exactly to that table's explicit ``StructType`` (resolved
-   from the ``schemas/`` registry).
+   registered builder (the 1:1 stored-procedure logic) to produce a DataFrame that
+   conforms exactly to that table's explicit ``StructType`` (resolved from the
+   ``schemas/`` registry).
 #. Write each output through :mod:`lib.delta_io` using the manifest's per-table
    ``write_mode`` (``merge`` or ``overwrite``); a ``merge`` passes the manifest's
    merge condition after deterministic alias normalization (see
@@ -90,16 +91,21 @@ items below are reconciled by editing the manifest / schemas (NOT this job's con
 flow). The following MUST be reconciled before production cutover:
 
 #. **1:1 logic.** The output builders (:func:`build_fact_general_ledger`,
-   :func:`build_dim_account_snapshot`) are a representative finance template; their
-   bodies MUST be reconciled 1:1 with the real ``dbo.usp_load_gl_outputs`` definition.
-#. **Output-stage ``reads`` vs. output grain.** The manifest declares
-   ``reads: [staging_3_balances]`` (``account`` x ``date`` grain), but
-   ``fact_general_ledger`` is entry-grain ``[gl_entry_id, ...]`` and
-   ``dim_account_snapshot`` needs account reference attributes
-   (``account_name``/``account_type``). The real procedure reads additional /
-   entry-grain upstream tables -- reconcile the manifest ``reads`` for this stage.
-   Because this job reads EVERY table in ``stage["reads"]`` generically, expanding
-   ``reads`` fixes the inputs with no edit to this job's control flow.
+   :func:`build_dim_account_snapshot`) now read entry-grain ``staging_2_enriched`` and
+   are grain-correct by construction (the GL fact preserves true entry keys; the
+   dimension selects each account's latest entry deterministically). What REMAINS to
+   reconcile against the real ``dbo.usp_load_gl_outputs`` is any additional entry-level
+   filter (e.g. posted-only) and whether the account dimension should instead be
+   sourced from an authoritative account/reference table (see item 2).
+#. **Output-stage ``reads`` vs. output grain (RESOLVED for grain).** The manifest now
+   declares ``reads: [staging_2_enriched]`` (ENTRY grain, ``[gl_entry_id, ...]``), so
+   ``fact_general_ledger`` preserves its true entry-grain ``(gl_entry_id, posting_date)``
+   merge keys with NO synthetic-key collisions, and ``dim_account_snapshot`` derives a
+   deterministic per-account latest-entry snapshot. If the real procedure sources the
+   account dimension from a dedicated account/reference table rather than the latest
+   transaction, add that table to this stage's ``reads`` -- because this job reads EVERY
+   table in ``stage["reads"]`` generically, expanding ``reads`` adds the input with no
+   edit to this job's control flow.
 #. **Schemas registry keys/columns.** ``schemas.get_schema("fact_general_ledger")``
    and ``schemas.get_schema("dim_account_snapshot")`` must resolve and their columns
    must match the manifest -- as authored they do (``schemas.output_tables`` declares
@@ -127,24 +133,29 @@ from __future__ import annotations
 
 import os
 
-from pyspark.sql import DataFrame, functions as F
+from pyspark.sql import DataFrame, Window, functions as F
 from pyspark.sql.types import StructType
 
 from lib.delta_io import count_rows, read_delta, write_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
+from lib.s3_paths import build_delta_table_uri
 from lib.spark_session import build_spark_session
 from schemas import get_schema
 
 # ---------------------------------------------------------------------------
 # Logical table names. Kept as module constants (never magic strings) so they are
 # reconciled in exactly one place against ``config/pipeline_manifest.yaml`` and the
-# ``schemas/`` registry keys. ``_PRIMARY_INPUT_TABLE`` is the single table the
-# output stage currently reads; the ``_FACT_*`` / ``_DIM_*`` names are both the
-# manifest ``writes`` entries AND the ``schemas.get_schema`` registry keys.
+# ``schemas/`` registry keys. ``_ENRICHED_INPUT_TABLE`` is the single table the
+# output stage reads -- it is the ENTRY-GRAIN ``staging_2_enriched`` table (one row
+# per GL entry), NOT the aggregated ``staging_3_balances`` (account x date grain).
+# Reading entry grain is what lets the GL fact preserve its true entry-level
+# ``gl_entry_id`` / ``posting_date`` merge keys and per-entry ``amount`` (Gate-1
+# parity; no synthetic-key collisions). The ``_FACT_*`` / ``_DIM_*`` names are both
+# the manifest ``writes`` entries AND the ``schemas.get_schema`` registry keys.
 # ---------------------------------------------------------------------------
-_PRIMARY_INPUT_TABLE = "staging_3_balances"
+_ENRICHED_INPUT_TABLE = "staging_2_enriched"
 _FACT_GENERAL_LEDGER = "fact_general_ledger"
 _DIM_ACCOUNT_SNAPSHOT = "dim_account_snapshot"
 
@@ -169,12 +180,19 @@ def _resolve_glue_run_id() -> str:
         run_id = resolved.get("JOB_RUN_ID", "")
         if run_id:
             return run_id
-    except Exception:
+    except Exception as exc:
         # Best-effort only: the run id is a non-essential log field, so any failure
         # to resolve it (for example ``awsglue`` being unavailable in a local / test
         # context) must NOT fail the job. This handler does not guard any Delta /
-        # DynamoDB operation, so it preserves ACID strictness.
-        pass
+        # DynamoDB operation, so it preserves ACID strictness. Record the benign
+        # reason at debug level (no no-op ``pass``) and fall through to the
+        # environment / literal fallback below.
+        get_logger("stage_n_output").debug(
+            "Glue run id unresolved via resolve_options (%s: %s); falling back "
+            "to the JOB_RUN_ID environment variable or 'unknown'.",
+            type(exc).__name__,
+            exc,
+        )
     return os.environ.get("JOB_RUN_ID", "") or "unknown"
 
 
@@ -218,24 +236,32 @@ def _resolve_table(manifest: Manifest, name: str) -> dict:
 
 
 def _delta_path(delta_bucket: str, defaults: dict, table: dict) -> str:
-    """Compose the fully qualified ``s3a://`` Delta table location.
+    """Compose the fully qualified, validated ``s3a://`` Delta table location.
 
-    Built as ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}``
-    with defensive slash-stripping so stray separators in the manifest never produce
-    a doubled ``//``. ``delta_bucket`` is the scheme-less DELTA_S3_BUCKET job arg; the
-    prefix and per-table path are relative, env-agnostic manifest values, keeping
-    this composition portable across dev / nonprod / prod.
+    Delegates to :func:`lib.s3_paths.build_delta_table_uri`, which composes
+    ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}`` and
+    centrally validates every piece: the bucket is checked against S3 naming
+    rules (rejecting embedded schemes, slashes, backslashes, ``..`` and control
+    characters), and the prefix / per-table path segments reject traversal
+    tokens, embedded schemes, backslashes, control characters and empty /
+    absolute segments (CWE-22 hardening). For legitimate manifest values the
+    output is byte-identical to the prior slash-stripping composition, so the
+    Delta layout is unchanged. ``delta_bucket`` is the scheme-less
+    DELTA_S3_BUCKET job arg; the prefix and per-table path are relative,
+    env-agnostic manifest values, keeping this composition portable across
+    dev / nonprod / prod.
 
     :param delta_bucket: Destination bucket name, without an ``s3a://`` scheme.
     :param defaults: The manifest ``defaults`` mapping (uses ``delta_path_prefix``).
     :param table: The resolved table mapping (uses its relative ``path``).
-    :returns: The fully qualified ``s3a://`` location of the Delta table.
+    :returns: The fully qualified, validated ``s3a://`` location of the Delta table.
+    :raises lib.s3_paths.S3PathError: If the bucket or any path segment is unsafe.
     """
-    bucket = delta_bucket.strip().strip("/")
-    prefix = str(defaults.get("delta_path_prefix", "")).strip("/")
-    rel_path = str(table.get("path", "")).strip("/")
-    segments = [segment for segment in (prefix, rel_path) if segment]
-    return f"s3a://{bucket}/" + "/".join(segments)
+    return build_delta_table_uri(
+        delta_bucket,
+        str(defaults.get("delta_path_prefix", "")),
+        str(table.get("path", "")),
+    )
 
 
 def _conform_to_schema(df: DataFrame, schema: StructType) -> DataFrame:
@@ -346,96 +372,120 @@ def _require_input(inputs: dict[str, DataFrame], name: str) -> DataFrame:
 # real ``dbo.usp_load_gl_outputs`` before production cutover.
 # ---------------------------------------------------------------------------
 def build_fact_general_ledger(inputs: dict[str, DataFrame], load_run_id: str) -> DataFrame:
-    """Build the ``fact_general_ledger`` output rows from the available input(s).
+    """Build the ``fact_general_ledger`` output rows at TRUE GL-entry grain.
 
-    Representative 1:1 template for the GL-fact portion of ``dbo.usp_load_gl_outputs``.
-    The manifest merge key is ``(gl_entry_id, posting_date)`` and the Gate-1 parity
-    hash is ``[gl_entry_id, account_id, posting_date, amount, currency_code]``. Because
-    the only declared input (``staging_3_balances``) is at ``account`` x ``date`` grain
-    (see RECONCILIATION item 2), this template derives:
+    1:1 GL-fact portion of ``dbo.usp_load_gl_outputs``. The fact is an ENTRY-GRAIN
+    table: one output row per source GL entry, keyed by the true entry-level
+    ``(gl_entry_id, posting_date)`` merge key (the manifest merge condition), with the
+    Gate-1 parity hash ``[gl_entry_id, account_id, posting_date, amount, currency_code]``.
 
-    #. ``gl_entry_id`` -- a DETERMINISTIC synthetic key
-       ``{account_id}-{yyyyMMdd posting_date}`` so re-runs upsert the same key set and
-       the merge never grows the row count (Gate 3). The real procedure supplies a true
-       entry-grain ``gl_entry_id``; reconcile by expanding the stage ``reads``.
-    #. ``amount`` -- the rolled-up ``balance_amount`` (an exact ``DECIMAL(18, 2)``;
-       conformed to the schema's decimal type, never a float).
-    #. ``debit_credit_indicator`` -- a deterministic, order-independent side derived
-       from the rolled-up subtotals (``"D"`` when debit >= credit else ``"C"``).
+    It reads the entry-grain ``staging_2_enriched`` table (one row per GL entry) and
+    performs a straight projection that PRESERVES every true entry attribute -- it does
+    NOT synthesize keys and does NOT roll up to a coarser grain:
+
+    #. ``gl_entry_id`` -- the TRUE per-entry key carried straight from the source (the
+       schema declares it NOT NULL; Stage 0/1 guarantee it is populated). Because it is
+       the genuine entry key, distinct entries that merely share an ``account_id`` /
+       ``posting_date`` (e.g. rows split by currency or cost-center) remain distinct
+       rows and CANNOT collide on the ``(gl_entry_id, posting_date)`` merge key.
+    #. ``amount`` -- the TRUE per-entry ``amount`` (exact ``DECIMAL(18, 2)``), NOT a
+       rolled-up balance. The signed rollup lives in Stage 3's ``balance_amount``;
+       the GL fact preserves entry-level amounts for entry-grain parity.
+    #. ``debit_credit_indicator`` -- the TRUE per-entry side carried straight through
+       (Stage 1 canonicalized it to ``"D"`` / ``"C"`` / NULL), NOT inferred from
+       subtotals.
+    #. ``journal_id`` / ``source_system`` -- the TRUE entry-level values carried from
+       the source (entry grain makes these real columns rather than NULL fills).
     #. ``posting_date`` / ``account_id`` / ``currency_code`` / ``cost_center`` /
-       ``account_name`` / ``account_type`` -- carried straight through.
-    #. ``load_ts`` -- carried from the upstream ``computed_at`` audit stamp.
+       ``account_name`` / ``account_type`` / ``load_ts`` -- carried straight through.
 
-    Lineage (``load_run_id`` / ``load_timestamp``) is appended via
-    :func:`_with_lineage`; structural columns the balances grain cannot source
-    (``journal_id``, ``source_system``) are filled as typed NULLs by
-    :func:`_conform_to_schema`.
+    The projection is deterministic and order-independent, so the manifest ``merge``
+    upsert re-applies the same key set on every re-run and never grows the row count
+    (Gate 3 idempotency). Lineage (``load_run_id`` / ``load_timestamp``) is appended via
+    :func:`_with_lineage`. Every fact column is sourced from the entry-grain input, so
+    :func:`_conform_to_schema` fills no business columns with NULL.
+
+    Reconciliation note: confirm against the real ``dbo.usp_load_gl_outputs`` whether
+    the GL fact applies any additional entry-level filter (e.g. posted-only) or column
+    derivation; the grain and the true-key preservation are now correct by construction.
 
     :param inputs: Logical table name -> read DataFrame (from the stage ``reads``).
     :param load_run_id: The resolved run identity for lineage.
     :returns: A DataFrame conforming exactly to ``schemas.get_schema("fact_general_ledger")``.
     """
-    balances = _require_input(inputs, _PRIMARY_INPUT_TABLE)
+    enriched = _require_input(inputs, _ENRICHED_INPUT_TABLE)
 
-    # Deterministic synthetic entry id at the (account, date) grain. Both source
-    # columns are non-nullable upstream, so the key is always non-null (the schema
-    # declares ``gl_entry_id`` NOT NULL) and stable across re-runs.
-    gl_entry_id = F.concat_ws(
-        "-", F.col("account_id"), F.date_format(F.col("posting_date"), "yyyyMMdd")
-    )
-
-    # Deterministic representative debit/credit side from the rolled-up subtotals;
-    # ``coalesce(..., 0)`` collapses NULL subtotals so the comparison is total.
-    debit = F.coalesce(F.col("debit_amount"), F.lit(0))
-    credit = F.coalesce(F.col("credit_amount"), F.lit(0))
-    indicator = F.when(debit >= credit, F.lit("D")).otherwise(F.lit("C"))
-
-    fact = balances.select(
-        gl_entry_id.alias("gl_entry_id"),
+    # Straight entry-grain projection: preserve the TRUE entry key, amount, side,
+    # journal id and source system -- no synthesized keys, no aggregation. Distinct
+    # entries therefore stay distinct, so the (gl_entry_id, posting_date) merge key
+    # is collision-free.
+    fact = enriched.select(
+        F.col("gl_entry_id"),
         F.col("posting_date"),
+        F.col("journal_id"),
         F.col("account_id"),
-        F.col("balance_amount").alias("amount"),
+        F.col("amount"),
         F.col("currency_code"),
-        indicator.alias("debit_credit_indicator"),
+        F.col("debit_credit_indicator"),
         F.col("cost_center"),
         F.col("account_name"),
         F.col("account_type"),
-        F.col("computed_at").alias("load_ts"),
+        F.col("source_system"),
+        F.col("load_ts"),
     )
     fact = _with_lineage(fact, load_run_id)
     return _conform_to_schema(fact, get_schema(_FACT_GENERAL_LEDGER))
 
 
 def build_dim_account_snapshot(inputs: dict[str, DataFrame], load_run_id: str) -> DataFrame:
-    """Build the ``dim_account_snapshot`` output rows from the available input(s).
+    """Build the ``dim_account_snapshot`` output rows at ACCOUNT grain.
 
-    Representative 1:1 template for the account-dimension portion of
-    ``dbo.usp_load_gl_outputs``. The output is at ACCOUNT grain (natural key
-    ``account_id``) and its Gate-1 parity hash is
-    ``[account_id, account_name, account_type, cost_center, currency_code]``. The only
-    declared input (``staging_3_balances``) is at ``account`` x ``date`` grain, so this
-    template collapses it to one row per ``account_id`` using DETERMINISTIC,
-    order-independent aggregates (group-by + :func:`~pyspark.sql.functions.max` over the
-    account-constant attributes, and ``max(posting_date)`` as a representative
-    ``snapshot_date``). Group + max is independent of input ordering, so the
-    ``overwrite`` output is byte-identical across re-runs (Gate 3).
+    1:1 account-dimension portion of ``dbo.usp_load_gl_outputs``. The output is at
+    ACCOUNT grain (natural key ``account_id``, one row per account) and its Gate-1
+    parity hash is ``[account_id, account_name, account_type, cost_center,
+    currency_code]``. It reads the entry-grain ``staging_2_enriched`` table and selects,
+    for each account, the attributes of that account's LATEST GL entry -- a true
+    point-in-time snapshot rather than an arbitrary aggregate of rolled-up balances.
 
-    Lineage (``load_run_id`` / ``load_timestamp``) is appended via
-    :func:`_with_lineage`; ``source_system`` (not sourced at this grain) is filled as a
-    typed NULL by :func:`_conform_to_schema`.
+    Determinism (Gate 3): the latest entry is chosen with a window
+    ``row_number()`` over ``partitionBy(account_id)`` ordered by ``posting_date``
+    descending then ``gl_entry_id`` descending, keeping ``row_number() == 1``. Because
+    ``gl_entry_id`` is the unique entry key, the ordering is a TOTAL order within each
+    account partition, so exactly one row is selected deterministically and the
+    ``overwrite`` output is byte-identical across re-runs regardless of input ordering.
+    ``snapshot_date`` is that latest entry's ``posting_date``. Every snapshot attribute
+    (including ``source_system``) is sourced from the entry, so :func:`_conform_to_schema`
+    fills no business column with NULL.
+
+    Lineage (``load_run_id`` / ``load_timestamp``) is appended via :func:`_with_lineage`.
+
+    Reconciliation note: confirm against the real ``dbo.usp_load_gl_outputs`` whether the
+    account dimension is sourced from an authoritative account/reference table rather
+    than the latest transactional entry; if so, add that reference table to the stage
+    ``reads`` and source the snapshot from it. The account grain and deterministic
+    selection are correct by construction.
 
     :param inputs: Logical table name -> read DataFrame (from the stage ``reads``).
     :param load_run_id: The resolved run identity for lineage.
     :returns: A DataFrame conforming exactly to ``schemas.get_schema("dim_account_snapshot")``.
     """
-    balances = _require_input(inputs, _PRIMARY_INPUT_TABLE)
+    enriched = _require_input(inputs, _ENRICHED_INPUT_TABLE)
 
-    snapshot = balances.groupBy("account_id").agg(
-        F.max("account_name").alias("account_name"),
-        F.max("account_type").alias("account_type"),
-        F.max("cost_center").alias("cost_center"),
-        F.max("currency_code").alias("currency_code"),
-        F.max("posting_date").alias("snapshot_date"),
+    # Deterministic "latest entry per account" selection. orderBy(posting_date desc,
+    # gl_entry_id desc) is a total order within each account partition (gl_entry_id is
+    # the unique entry key), so row_number()==1 picks exactly one row deterministically.
+    latest_entry = Window.partitionBy("account_id").orderBy(
+        F.col("posting_date").desc(), F.col("gl_entry_id").desc()
+    )
+    ranked = enriched.withColumn("_rn", F.row_number().over(latest_entry))
+    snapshot = ranked.where(F.col("_rn") == 1).select(
+        F.col("account_id"),
+        F.col("account_name"),
+        F.col("account_type"),
+        F.col("cost_center"),
+        F.col("currency_code"),
+        F.col("source_system"),
+        F.col("posting_date").alias("snapshot_date"),
     )
     snapshot = _with_lineage(snapshot, load_run_id)
     return _conform_to_schema(snapshot, get_schema(_DIM_ACCOUNT_SNAPSHOT))

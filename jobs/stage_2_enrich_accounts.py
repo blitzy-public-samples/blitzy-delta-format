@@ -105,12 +105,13 @@ from __future__ import annotations
 import os
 
 from pyspark.sql import DataFrame, functions as F
-from pyspark.sql.types import StructType
+from pyspark.sql.types import DecimalType, StructType
 
 from lib.delta_io import count_rows, read_delta, write_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
+from lib.s3_paths import build_delta_table_uri
 from lib.spark_session import build_spark_session
 from schemas import get_schema
 
@@ -130,6 +131,17 @@ _ACCOUNT_TYPE_BY_LEADING_DIGIT = (
 )
 _UNCLASSIFIED_ACCOUNT_TYPE = "UNCLASSIFIED"
 
+# Canonical debit / credit indicator tokens (Stage 1 normalizes the raw indicator to
+# exactly these). Used to derive ``signed_amount``: a credit ("C") is stored negative,
+# every other side (a debit "D", or an unrecognized / NULL token) is stored positive.
+# These MUST stay identical to the Stage 3 convention so the Stage 3 ``sum(signed_amount)``
+# rollup yields byte-identical ``balance_amount`` values (Gate-1 parity).
+_CREDIT_INDICATOR = "C"
+# Exact monetary type for ``signed_amount`` -- DECIMAL(18, 2), never a floating-point
+# type, matching ``amount`` and the ``staging_2_enriched.signed_amount`` schema field.
+_MONEY_PRECISION = 18
+_MONEY_SCALE = 2
+
 
 def _resolve_glue_run_id() -> str:
     """Resolve the Glue job-run id best-effort (a CloudWatch log field only).
@@ -148,12 +160,19 @@ def _resolve_glue_run_id() -> str:
         run_id = resolved.get("JOB_RUN_ID", "")
         if run_id:
             return run_id
-    except Exception:
+    except Exception as exc:
         # Best-effort only: the run id is a non-essential log field, so any
         # failure to resolve it (for example ``awsglue`` being unavailable in a
         # local / test context) must NOT fail the job. This handler does not
         # guard any Delta / DynamoDB operation, so it preserves ACID strictness.
-        pass
+        # Record the benign reason at debug level (no no-op ``pass``) and fall
+        # through to the environment / literal fallback below.
+        get_logger("stage_2_enrich_accounts").debug(
+            "Glue run id unresolved via resolve_options (%s: %s); falling back "
+            "to the JOB_RUN_ID environment variable or 'unknown'.",
+            type(exc).__name__,
+            exc,
+        )
     return os.environ.get("JOB_RUN_ID", "") or "unknown"
 
 
@@ -196,24 +215,32 @@ def _resolve_table(manifest: Manifest, name: str) -> dict:
 
 
 def _delta_path(delta_bucket: str, defaults: dict, table: dict) -> str:
-    """Compose the fully qualified ``s3a://`` Delta table location.
+    """Compose the fully qualified, validated ``s3a://`` Delta table location.
 
-    Built as ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}``
-    with defensive slash-stripping so stray separators in the manifest never
-    produce a doubled ``//``. ``delta_bucket`` is the scheme-less DELTA_S3_BUCKET
-    job arg; the prefix and per-table path are relative, env-agnostic manifest
-    values, keeping this composition portable across dev / nonprod / prod.
+    Delegates to :func:`lib.s3_paths.build_delta_table_uri`, which composes
+    ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}`` and
+    centrally validates every piece: the bucket is checked against S3 naming
+    rules (rejecting embedded schemes, slashes, backslashes, ``..`` and control
+    characters), and the prefix / per-table path segments reject traversal
+    tokens, embedded schemes, backslashes, control characters and empty /
+    absolute segments (CWE-22 hardening). For legitimate manifest values the
+    output is byte-identical to the prior slash-stripping composition, so the
+    Delta layout is unchanged. ``delta_bucket`` is the scheme-less
+    DELTA_S3_BUCKET job arg; the prefix and per-table path are relative,
+    env-agnostic manifest values, keeping this composition portable across
+    dev / nonprod / prod.
 
     :param delta_bucket: Destination bucket name, without an ``s3a://`` scheme.
     :param defaults: The manifest ``defaults`` mapping (uses ``delta_path_prefix``).
     :param table: The resolved table mapping (uses its relative ``path``).
-    :returns: The fully qualified ``s3a://`` location of the Delta table.
+    :returns: The fully qualified, validated ``s3a://`` location of the Delta table.
+    :raises lib.s3_paths.S3PathError: If the bucket or any path segment is unsafe.
     """
-    bucket = delta_bucket.strip().strip("/")
-    prefix = str(defaults.get("delta_path_prefix", "")).strip("/")
-    rel_path = str(table.get("path", "")).strip("/")
-    segments = [segment for segment in (prefix, rel_path) if segment]
-    return f"s3a://{bucket}/" + "/".join(segments)
+    return build_delta_table_uri(
+        delta_bucket,
+        str(defaults.get("delta_path_prefix", "")),
+        str(table.get("path", "")),
+    )
 
 
 def _conform_to_schema(df: DataFrame, schema: StructType) -> DataFrame:
@@ -260,6 +287,15 @@ def enrich_accounts(df: DataFrame) -> DataFrame:
        joining the derived ``account_type`` with the trimmed ``account_id`` via
        :func:`~pyspark.sql.functions.concat_ws` (which skips null segments, so the
        label is well-defined even if a segment is unexpectedly null).
+    #. **Signed amount** -- derive ``signed_amount`` by applying the debit / credit
+       sign convention to ``amount``: a credit (canonical ``debit_credit_indicator``
+       ``"C"``) is stored negative, while a debit (``"D"``) or any unrecognized /
+       NULL side keeps the positive ``amount``. The result is cast to the exact
+       ``DecimalType(18, 2)`` (never a float) so it conforms to the non-nullable
+       ``staging_2_enriched.signed_amount`` field and stays byte-exact. This is the
+       **single, authoritative** sign derivation for the pipeline: Stage 3 consumes
+       this column directly (``sum(signed_amount)``) rather than re-deriving the sign,
+       so the convention lives in exactly one place.
     #. **Audit** -- stamp ``enriched_at`` with the processing-time
        :func:`~pyspark.sql.functions.current_timestamp`.
 
@@ -275,15 +311,16 @@ def enrich_accounts(df: DataFrame) -> DataFrame:
     with the real ``dbo.usp_enrich_accounts`` body before production cutover. A real
     enrichment commonly **joins a reference / account-dimension table** to source
     ``account_name`` / ``account_type`` rather than deriving them from the account-id
-    prefix; wire that join here once the dimension source is confirmed. A
-    representative ``signed_amount`` sign convention (negate ``amount`` when
-    ``debit_credit_indicator`` is ``"C"``, otherwise keep it) is part of the broader
-    template but is deliberately NOT emitted, because the authoritative
-    ``staging_2_enriched`` schema declares no such column.
+    prefix; wire that join here once the dimension source is confirmed. The
+    ``signed_amount`` sign convention (negate ``amount`` when ``debit_credit_indicator``
+    is ``"C"``, otherwise keep it) must likewise be reconciled against the procedure's
+    exact debit/credit treatment; it is emitted here as the authoritative signed value
+    that Stage 3 sums into ``balance_amount``.
 
     :param df: The ``staging_1_cleansed`` DataFrame (typed per
         ``schemas.staging_tables.STAGING_1_CLEANSED``).
-    :returns: The enriched DataFrame, ready to be conformed to ``staging_2_enriched``.
+    :returns: The enriched DataFrame (carrying the derived ``signed_amount``), ready
+        to be conformed to ``staging_2_enriched``.
     """
     enriched = df
 
@@ -310,7 +347,24 @@ def enrich_accounts(df: DataFrame) -> DataFrame:
         F.concat_ws(" ", F.col("account_type"), F.trim(F.col("account_id"))),
     )
 
-    # (4) Stamp the enrichment audit timestamp.
+    # (4) Derive and EMIT signed_amount: a credit ("C") is stored negative, every
+    #     other side (debit "D", or an unrecognized / NULL token) stays positive.
+    #     ``coalesce(..., lit(False))`` collapses three-valued logic so a NULL
+    #     indicator is treated as "not a credit" rather than propagating NULL into the
+    #     sign decision. The cast to the exact DECIMAL(18, 2) (amount is already
+    #     DECIMAL(18, 2), so +/- amount is lossless) conforms to the non-nullable
+    #     staging_2_enriched.signed_amount field. This is the single authoritative
+    #     sign derivation; Stage 3 consumes this column via sum(signed_amount) instead
+    #     of re-deriving the sign, keeping the convention in exactly one place and
+    #     guaranteeing identical balance_amount rollups (Gate-1 parity).
+    indicator = F.upper(F.trim(F.col("debit_credit_indicator")))
+    is_credit = F.coalesce(indicator == F.lit(_CREDIT_INDICATOR), F.lit(False))
+    signed_amount = F.when(is_credit, -F.col("amount")).otherwise(F.col("amount"))
+    enriched = enriched.withColumn(
+        "signed_amount", signed_amount.cast(DecimalType(_MONEY_PRECISION, _MONEY_SCALE))
+    )
+
+    # (5) Stamp the enrichment audit timestamp.
     enriched = enriched.withColumn("enriched_at", F.current_timestamp())
 
     return enriched

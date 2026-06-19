@@ -39,10 +39,13 @@ three tables defined here are reconciled 1:1 to that manifest's staging catalog:
 
 * :data:`STAGING_1_CLEANSED` (table ``staging_1_cleansed``) — the cleansed,
   row-level output of ``dbo.usp_cleanse_transactions``: the raw GL feed typed and
-  normalized at row granularity, plus a cleanse audit timestamp.
+  normalized at row granularity, plus a derived ``is_valid`` Boolean validity
+  indicator and a cleanse audit timestamp.
 * :data:`STAGING_2_ENRICHED` (table ``staging_2_enriched``) — the enriched output
   of ``dbo.usp_enrich_accounts``: the cleansed rows decorated with account
-  attributes (``account_name``, ``account_type``) consumed by the output stage.
+  attributes (``account_name``, ``account_type``) and a derived ``signed_amount``
+  (the debit/credit-signed monetary measure) consumed by the balance and output
+  stages.
 * :data:`STAGING_3_BALANCES` (table ``staging_3_balances``) — the balances output
   of ``dbo.usp_compute_balances``: per ``(account_id, posting_date)`` rolled-up
   balance / debit / credit amounts and an entry count.
@@ -77,6 +80,7 @@ neighbours when the manifest is changed.
 from typing import Dict
 
 from pyspark.sql.types import (
+    BooleanType,
     DateType,
     DecimalType,
     LongType,
@@ -99,7 +103,8 @@ _MONEY_SCALE = 2
 # staging_1_cleansed — cleansed, row-level output of the "cleanse transactions"
 # stored procedure (``dbo.usp_cleanse_transactions``). Derivable 1:1 from
 # ``schemas/staging_raw.py``: raw delimited GL records, typed and normalized at
-# row granularity, plus a cleanse audit timestamp. Manifest hash columns:
+# row granularity, plus a derived ``is_valid`` Boolean validity indicator and a
+# cleanse audit timestamp. Manifest hash columns:
 # (gl_entry_id, account_id, posting_date, amount, currency_code); key: gl_entry_id.
 # ---------------------------------------------------------------------------
 STAGING_1_CLEANSED: StructType = StructType(
@@ -118,6 +123,13 @@ STAGING_1_CLEANSED: StructType = StructType(
         StructField("cost_center", StringType(), nullable=True),
         StructField("source_system", StringType(), nullable=True),
         StructField("load_ts", TimestampType(), nullable=True),
+        # --- Row-level validity indicator derived by the cleanse stage ---
+        # ``dbo.usp_cleanse_transactions`` evaluates each row's business keys and
+        # records the result as an explicit Boolean column rather than silently
+        # dropping non-conforming rows. It is always computed (never NULL), so the
+        # field is non-nullable; it is deliberately NOT one of the manifest's five
+        # parity hash columns, so its presence does not affect the Gate-1 hash.
+        StructField("is_valid", BooleanType(), nullable=False),
         # --- Audit timestamp of when the row was cleansed ---
         StructField("cleansed_at", TimestampType(), nullable=True),
     ]
@@ -127,8 +139,10 @@ STAGING_1_CLEANSED: StructType = StructType(
 # ---------------------------------------------------------------------------
 # staging_2_enriched — enriched output of the "enrich accounts" stored procedure
 # (``dbo.usp_enrich_accounts``). The cleansed rows decorated with account master
-# attributes (``account_name``, ``account_type``) that ``staging_3_balances`` and
-# the final ``dim_account_snapshot`` consume. Manifest hash columns:
+# attributes (``account_name``, ``account_type``) and a derived debit/credit-signed
+# ``signed_amount`` measure that ``staging_3_balances`` sums and that the final
+# ``fact_general_ledger`` / ``dim_account_snapshot`` entry-grain output consumes.
+# Manifest hash columns:
 # (gl_entry_id, account_id, posting_date, amount, currency_code); key: gl_entry_id.
 # ---------------------------------------------------------------------------
 STAGING_2_ENRICHED: StructType = StructType(
@@ -140,6 +154,17 @@ STAGING_2_ENRICHED: StructType = StructType(
         StructField("posting_date", DateType(), nullable=False),
         StructField(
             "amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=False
+        ),
+        # --- Signed monetary measure derived by the enrich stage ---
+        # ``dbo.usp_enrich_accounts`` emits a per-entry ``signed_amount`` (the
+        # ``amount`` negated for a credit and kept for a debit) that the downstream
+        # balance stage (``dbo.usp_compute_balances``) sums directly, rather than
+        # each stage independently re-deriving the sign. It is derived from the
+        # non-nullable ``amount`` (debit/credit-aware) so it is itself never NULL.
+        # It is NOT one of the manifest's five parity hash columns, so its presence
+        # does not affect the Gate-1 hash.
+        StructField(
+            "signed_amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=False
         ),
         # --- Descriptive / provenance attributes ---
         StructField("currency_code", StringType(), nullable=True),

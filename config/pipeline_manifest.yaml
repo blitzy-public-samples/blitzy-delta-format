@@ -198,5 +198,13 @@ stages:
     type: output
     job_script: "jobs/stage_n_output.py"
     replaces_stored_procedure: "dbo.usp_load_gl_outputs"
-    reads: [staging_3_balances]
+    # Reads the ENTRY-GRAIN enriched detail (one row per gl_entry_id) so the
+    # entry-grain `fact_general_ledger` preserves the true (gl_entry_id,
+    # posting_date) merge key and per-entry `amount` -- it is NOT built from the
+    # aggregated `staging_3_balances` (account x date x currency x cost-center
+    # grain), which would force a synthetic key and risk merge-key collisions.
+    # The account-grain `dim_account_snapshot` is collapsed from this same
+    # authoritative enriched detail. `staging_3_balances` remains a Gate-1
+    # parity deliverable produced by stage 3; the output stage does not consume it.
+    reads: [staging_2_enriched]
     writes: [fact_general_ledger, dim_account_snapshot]
