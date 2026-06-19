@@ -74,13 +74,15 @@ in :func:`enrich_accounts` are a representative finance template
 cost-center normalization), not the verified procedure body. In particular, a real
 enrichment commonly **joins a reference / account-dimension table** to source
 ``account_name`` / ``account_type`` rather than deriving them in-place -- wire that
-join in here once the dimension source is confirmed. A representative
+join in here once the dimension source is confirmed. The
 ``signed_amount`` sign convention (negate ``amount`` when ``debit_credit_indicator``
-is ``"C"``, keep it otherwise) is part of that broader template but is deliberately
-**not emitted**, because the authoritative ``staging_2_enriched`` schema does not
-declare such a column (the same way Stage 1 computes a validity indicator it does
-not emit); reconcile the schema first if the procedure truly outputs a signed
-amount. The ``schemas/`` registry key and columns for ``staging_2_enriched`` must
+is ``"C"``, keep it otherwise) is part of that broader template and **is emitted**
+here as a ``DecimalType(18, 2)`` column, because the authoritative
+``staging_2_enriched`` schema declares ``signed_amount`` as a NOT-NULL
+``DecimalType(18, 2)`` field that Stage 3 consumes directly -- it sums this column
+(``sum(signed_amount)``) into ``balance_amount``; reconcile this sign convention
+1:1 against the procedure's exact debit / credit treatment. The ``schemas/``
+registry key and columns for ``staging_2_enriched`` must
 likewise be reconciled so that ``schemas.get_schema('staging_2_enriched')``
 resolves -- as authored it does (the registry key matches the manifest table name),
 but the illustrative column model must be confirmed against the procedure's true
