@@ -38,8 +38,10 @@ the ACID guarantees) required across concurrent Glue drivers writing to the same
 ``S3SingleDriverLogStore`` -- or any other LogStore -- is prohibited, so this module hardcodes
 the implementation class and exposes no parameter that could swap it. A failed conditional
 write surfaces as an exception with no non-ACID fallback. :func:`build_spark_session`
-additionally rejects any ``extra_conf`` that attempts to override either LogStore key,
-enforcing the rule even against caller misuse.
+additionally rejects any ``extra_conf`` that attempts to override ANY of the six canonical
+Delta/LogStore configuration keys (the two LogStore implementation keys, the DynamoDB
+coordination ``ddb.tableName``/``ddb.region`` keys, and the Delta SQL extension/catalog keys)
+to a different value, enforcing ACID coordination even against caller misuse.
 
 Both ``spark.delta.logStore.s3.impl`` AND ``spark.delta.logStore.s3a.impl`` are set, because
 Spark/Hadoop may resolve an S3 location through either the ``s3://`` or the ``s3a://``
@@ -94,9 +96,6 @@ LOGSTORE_S3_IMPL_KEY = "spark.delta.logStore.s3.impl"
 LOGSTORE_S3A_IMPL_KEY = "spark.delta.logStore.s3a.impl"
 DDB_TABLE_NAME_KEY = "spark.io.delta.storage.S3DynamoDBLogStore.ddb.tableName"
 DDB_REGION_KEY = "spark.io.delta.storage.S3DynamoDBLogStore.ddb.region"
-
-#: LogStore implementation keys guarded against override in build_spark_session().
-_LOGSTORE_IMPL_KEYS = (LOGSTORE_S3_IMPL_KEY, LOGSTORE_S3A_IMPL_KEY)
 
 __all__ = [
     "DELTA_SQL_EXTENSION",
@@ -182,18 +181,21 @@ def build_spark_session(
             ``validate/`` runs. In an AWS Glue job, omit it so the Glue-managed context's
             master is used.
         extra_conf: Optional additional Spark configuration to merge on top of the canonical
-            Delta configuration. It may NOT override either LogStore implementation key to any
-            value other than :data:`S3_DYNAMODB_LOG_STORE`; attempting to do so raises
-            ``ValueError``. Any other keys (and re-asserting the LogStore keys to the same
-            value) are accepted.
+            Delta configuration. It may NOT override ANY of the six canonical Delta/LogStore
+            keys (the two LogStore implementation keys, the DynamoDB coordination
+            ``ddb.tableName``/``ddb.region`` keys, and the Delta SQL extension/catalog keys) to
+            a value different from the canonical one; attempting to do so raises ``ValueError``.
+            Brand-new keys -- and re-asserting any canonical key to its exact canonical value --
+            are accepted.
 
     Returns:
         A configured :class:`SparkSession` obtained via ``builder.getOrCreate()``.
 
     Raises:
         ValueError: If ``app_name`` is empty; if ``ddb_table_name`` or ``region`` is empty
-            (propagated from :func:`delta_logstore_conf`); or if ``extra_conf`` tries to point
-            a LogStore implementation key at anything other than :data:`S3_DYNAMODB_LOG_STORE`.
+            (propagated from :func:`delta_logstore_conf`); or if ``extra_conf`` tries to
+            override any of the six canonical Delta/LogStore configuration keys to a value
+            other than its canonical one.
 
     Example:
         >>> spark = build_spark_session(
@@ -211,11 +213,21 @@ def build_spark_session(
 
     conf = delta_logstore_conf(ddb_table_name, region)
     if extra_conf:
-        for key in _LOGSTORE_IMPL_KEYS:
-            if key in extra_conf and extra_conf[key] != S3_DYNAMODB_LOG_STORE:
+        # Guard ALL six canonical Delta/LogStore configuration keys against being
+        # overridden to a DIFFERENT value: the two LogStore implementation keys
+        # (s3.impl / s3a.impl), the DynamoDB coordination keys (ddb.tableName /
+        # ddb.region), and the Delta SQL extension / catalog keys. Diverting any of
+        # them could disable ACID coordination, route commits to the wrong (or no)
+        # DynamoDB coordination table, or deactivate the DeltaTable APIs. Re-asserting
+        # a canonical key to its exact canonical value is a harmless no-op and remains
+        # allowed; brand-new (non-canonical) keys are merged through unchanged.
+        for key, canonical_value in conf.items():
+            if key in extra_conf and extra_conf[key] != canonical_value:
                 raise ValueError(
-                    "LogStore override prohibited: S3DynamoDBLogStore only "
-                    f"(offending key: {key})"
+                    "Override of canonical Delta/LogStore configuration key "
+                    f"{key!r} is prohibited (S3DynamoDBLogStore coordination must "
+                    f"remain intact); expected {canonical_value!r}, got "
+                    f"{extra_conf[key]!r}"
                 )
         conf.update(extra_conf)
 

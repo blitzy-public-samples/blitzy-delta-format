@@ -136,7 +136,7 @@ tables:
     write_mode: merge
     merge:
       keys: [gl_entry_id, posting_date]
-      condition: "target.gl_entry_id = source.gl_entry_id AND target.posting_date = source.posting_date"
+      condition: "t.gl_entry_id = s.gl_entry_id AND t.posting_date = s.posting_date"
       when_matched: update_all
       when_not_matched: insert_all
     parity:

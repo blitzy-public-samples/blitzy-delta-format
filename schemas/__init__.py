@@ -70,7 +70,7 @@ Public API
 ----------
 Re-exported from the sibling modules:
 
-* :data:`STAGING_RAW_SCHEMA`, :data:`STAGING_RAW_TABLE_NAME`
+* :data:`STAGING_RAW`, :data:`STAGING_RAW_TABLE_NAME`
   -- from ``schemas.staging_raw``.
 * :data:`STAGING_SCHEMAS`, :func:`get_staging_schema`
   -- from ``schemas.staging_tables``.
@@ -92,7 +92,7 @@ from pyspark.sql.types import StructType
 # the ONLY first-party imports permitted here. Absolute intra-package form is
 # used for clarity; relative form (``from .staging_raw import ...``) would be
 # equivalent.
-from schemas.staging_raw import STAGING_RAW_SCHEMA, STAGING_RAW_TABLE_NAME
+from schemas.staging_raw import STAGING_RAW, STAGING_RAW_TABLE_NAME
 from schemas.staging_tables import STAGING_SCHEMAS, get_staging_schema
 from schemas.output_tables import OUTPUT_SCHEMAS, get_output_schema
 
@@ -156,7 +156,7 @@ def _merge_schema_sources(
 # spaces stay disjoint; a duplicate name fails the import immediately.
 # ---------------------------------------------------------------------------
 ALL_SCHEMAS: Dict[str, StructType] = _merge_schema_sources(
-    ("schemas.staging_raw", {STAGING_RAW_TABLE_NAME: STAGING_RAW_SCHEMA}),
+    ("schemas.staging_raw", {STAGING_RAW_TABLE_NAME: STAGING_RAW}),
     ("schemas.staging_tables", STAGING_SCHEMAS),
     ("schemas.output_tables", OUTPUT_SCHEMAS),
 )
@@ -176,7 +176,7 @@ def get_schema(table_name: str) -> StructType:
     Args:
         table_name: Logical Delta table name exactly as keyed in
             :data:`ALL_SCHEMAS` (for example, ``"staging_raw"``,
-            ``"staging_1"``, or ``"dim_customer"``).
+            ``"staging_1_cleansed"``, or ``"dim_account_snapshot"``).
 
     Returns:
         The :class:`~pyspark.sql.types.StructType` registered for the table.
@@ -200,7 +200,7 @@ def get_schema(table_name: str) -> StructType:
 
 __all__ = [
     # Re-exported from schemas.staging_raw
-    "STAGING_RAW_SCHEMA",
+    "STAGING_RAW",
     "STAGING_RAW_TABLE_NAME",
     # Re-exported from schemas.staging_tables
     "STAGING_SCHEMAS",

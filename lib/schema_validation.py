@@ -69,7 +69,7 @@ The ``jobs/stage_0_ingest.py`` entrypoint wires the helpers together as::
         .schema(all_string_schema_with_corrupt_record)
         .csv(source_path)
     )
-    result = validate_against_schema(df, STAGING_RAW_SCHEMA)
+    result = validate_against_schema(df, STAGING_RAW)
     quarantine_bad_records(result.bad_df, quarantine_path)
     enforce_bad_record_threshold(
         result.bad_count, result.total_count, bad_record_threshold
@@ -113,10 +113,6 @@ DEFAULT_CORRUPT_COLUMN: str = "_corrupt_record"
 # retained on ``bad_df`` (for debugging in quarantine) and dropped from
 # ``valid_df`` (which is projected to exactly the expected schema).
 VALIDATION_REASON_COLUMN: str = "_validation_reason"
-
-# Default on-disk format for the quarantine sink. Parquet is a raw debug sink --
-# deliberately NOT a Delta table -- so it never routes through ``lib.delta_io``.
-DEFAULT_QUARANTINE_FORMAT: str = "parquet"
 
 
 class SchemaValidationError(ValueError):
@@ -254,16 +250,16 @@ def validate_against_schema(
 def quarantine_bad_records(
     bad_df: DataFrame,
     quarantine_path: str,
-    *,
-    fmt: str = DEFAULT_QUARANTINE_FORMAT,
 ) -> int:
     """Write ``bad_df`` to the quarantine prefix and return its row count.
 
-    Bad records are persisted as a **raw debug sink** -- parquet by default, in
-    ``overwrite`` mode -- so re-running a stage for the same source overwrites the
-    prior quarantine rather than accumulating duplicates. This is intentionally
-    **not** a Delta table and does not route through ``lib.delta_io``; the
-    ``_validation_reason`` column is preserved to aid offline debugging.
+    Bad records are persisted as a **raw parquet debug sink**, in ``overwrite``
+    mode -- so re-running a stage for the same source overwrites the prior
+    quarantine rather than accumulating duplicates. The on-disk format is
+    **hardcoded to parquet** and is deliberately **not** caller-selectable: the
+    quarantine sink must never be a Delta (or any other transactional) table and
+    never routes through ``lib.delta_io``. The ``_validation_reason`` column is
+    preserved to aid offline debugging.
 
     The write is skipped when there are no bad records, so an empty quarantine
     directory is never created.
@@ -272,17 +268,15 @@ def quarantine_bad_records(
         :func:`validate_against_schema` (retains ``_validation_reason``).
     :param quarantine_path: Fully qualified destination prefix (for example
         ``s3a://bucket/quarantine/<pipeline>/<run>``).
-    :param fmt: On-disk format for the raw sink; defaults to ``"parquet"``.
     :returns: The number of quarantined (bad) records.
     """
     count = bad_df.count()
     if count > 0:
-        bad_df.write.format(fmt).mode("overwrite").save(quarantine_path)
+        bad_df.write.format("parquet").mode("overwrite").save(quarantine_path)
         _LOGGER.info(
-            "quarantined %d bad record(s) to %s (format=%s)",
+            "quarantined %d bad record(s) to %s (format=parquet)",
             count,
             quarantine_path,
-            fmt,
         )
     else:
         _LOGGER.info(
@@ -327,7 +321,6 @@ def validate_and_quarantine(
     threshold: float,
     *,
     corrupt_column: str = DEFAULT_CORRUPT_COLUMN,
-    fmt: str = DEFAULT_QUARANTINE_FORMAT,
 ) -> ValidationResult:
     """Run the full validate -> quarantine -> threshold flow as one call.
 
@@ -346,14 +339,13 @@ def validate_and_quarantine(
         sink.
     :param threshold: Maximum tolerated bad-record rate (Stage 0 default ``0.0``).
     :param corrupt_column: PERMISSIVE-mode corrupt-record column name.
-    :param fmt: On-disk format for the quarantine sink (default ``"parquet"``).
     :returns: The :class:`ValidationResult` from :func:`validate_against_schema`.
     :raises SchemaValidationError: If a required column is missing (fatal).
     :raises BadRecordThresholdExceeded: If the bad-record rate exceeds
         ``threshold`` (job exits non-zero).
     """
     result = validate_against_schema(df, expected, corrupt_column=corrupt_column)
-    quarantine_bad_records(result.bad_df, quarantine_path, fmt=fmt)
+    quarantine_bad_records(result.bad_df, quarantine_path)
     rate = (result.bad_count / result.total_count) if result.total_count else 0.0
     # The mandated one-line summary, emitted BEFORE threshold enforcement so it
     # is present in CloudWatch even on the run that fails the job.

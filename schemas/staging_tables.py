@@ -28,20 +28,28 @@ next intermediate ``staging_<n>`` table in ``overwrite`` mode.
 
 The schemas are exposed through :data:`STAGING_SCHEMAS`, a registry keyed by
 table name, so that a job can resolve its output schema purely from the table
-name declared in the pipeline manifest. Adding a stage later therefore means
-adding one registry entry (and its ``STAGING_<n>_SCHEMA`` definition) with **no
-change to any consumer code**.
+name declared in the pipeline manifest. Each symbol name also matches the
+``schema.symbol`` the manifest references for that table.
 
-Reconciliation directive
-------------------------
-The number of staging stages ``N`` and each table's columns are **authoritative
-in the pipeline manifest** (``config/pipeline_manifest``). The two tables defined
-here (:data:`STAGING_1_SCHEMA`, :data:`STAGING_2_SCHEMA`) are an **illustrative
-finance template** that demonstrates the two common intermediate shapes — a
-cleansed, row-level table and an account-by-month aggregate. Add or rename
-``STAGING_<n>_SCHEMA`` definitions and their registry keys to match the
-manifest's stored-procedure-to-job map (one intermediate table per stored
-procedure) **before production cutover**.
+Authoritative reconciliation
+-----------------------------
+The number of staging stages ``N``, each table's name, and its columns are
+authoritative in the pipeline manifest (``config/pipeline_manifest.yaml``). The
+three tables defined here are reconciled 1:1 to that manifest's staging catalog:
+
+* :data:`STAGING_1_CLEANSED` (table ``staging_1_cleansed``) — the cleansed,
+  row-level output of ``dbo.usp_cleanse_transactions``: the raw GL feed typed and
+  normalized at row granularity, plus a cleanse audit timestamp.
+* :data:`STAGING_2_ENRICHED` (table ``staging_2_enriched``) — the enriched output
+  of ``dbo.usp_enrich_accounts``: the cleansed rows decorated with account
+  attributes (``account_name``, ``account_type``) consumed by the output stage.
+* :data:`STAGING_3_BALANCES` (table ``staging_3_balances``) — the balances output
+  of ``dbo.usp_compute_balances``: per ``(account_id, posting_date)`` rolled-up
+  balance / debit / credit amounts and an entry count.
+
+Each table carries every column the manifest's ``parity.hash_columns`` and
+``parity.key_columns`` reference for it, so the Gate-1 parity hash and key joins
+resolve against a real column.
 
 Schema-safety and purity guarantees
 -----------------------------------
@@ -60,19 +68,17 @@ Schema-safety and purity guarantees
 
 Column lineage
 --------------
-``staging_1`` is derivable directly from ``schemas/staging_raw.py`` (raw
-delimited records, typed and normalized at row granularity), and the aggregated
-``staging_2`` feeds ``schemas/output_tables.py``. Keep these definitions
-coherent with both neighbours when the manifest is reconciled.
+``staging_1_cleansed`` is derivable directly from ``schemas/staging_raw.py``;
+``staging_2_enriched`` adds the account attributes that ``staging_3_balances`` and
+``schemas/output_tables.py`` consume. Keep these definitions coherent with both
+neighbours when the manifest is changed.
 """
 
 from typing import Dict
 
 from pyspark.sql.types import (
-    BooleanType,
     DateType,
     DecimalType,
-    IntegerType,
     LongType,
     StringType,
     StructField,
@@ -90,30 +96,28 @@ _MONEY_SCALE = 2
 
 
 # ---------------------------------------------------------------------------
-# staging_1 — cleansed, row-level output of a "cleanse / normalize" stored
-# procedure. Derivable 1:1 from ``schemas/staging_raw.py``: raw delimited
-# records are typed, normalized, and flagged for validity at row granularity.
+# staging_1_cleansed — cleansed, row-level output of the "cleanse transactions"
+# stored procedure (``dbo.usp_cleanse_transactions``). Derivable 1:1 from
+# ``schemas/staging_raw.py``: raw delimited GL records, typed and normalized at
+# row granularity, plus a cleanse audit timestamp. Manifest hash columns:
+# (gl_entry_id, account_id, posting_date, amount, currency_code); key: gl_entry_id.
 # ---------------------------------------------------------------------------
-STAGING_1_SCHEMA: StructType = StructType(
+STAGING_1_CLEANSED: StructType = StructType(
     [
-        # --- Keys / mandatory lineage columns (non-nullable) ---
-        StructField("transaction_id", StringType(), nullable=False),
+        # --- Financial-identity anchors (non-nullable) ---
+        StructField("gl_entry_id", StringType(), nullable=False),
+        StructField("journal_id", StringType(), nullable=True),
         StructField("account_id", StringType(), nullable=False),
-        # --- Optional descriptive / foreign-key columns ---
-        StructField("customer_id", StringType(), nullable=True),
-        # --- Event dates: the transaction date is mandatory; posting may lag ---
-        StructField("transaction_date", DateType(), nullable=False),
-        StructField("posting_date", DateType(), nullable=True),
-        # --- Monetary value: exact decimal, mandatory ---
+        StructField("posting_date", DateType(), nullable=False),
         StructField(
             "amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=False
         ),
+        # --- Descriptive / provenance attributes ---
         StructField("currency_code", StringType(), nullable=True),
-        StructField("transaction_type", StringType(), nullable=True),
-        StructField("merchant_name", StringType(), nullable=True),
-        StructField("normalized_description", StringType(), nullable=True),
-        # --- Validity flag set by the cleanse step (mandatory) ---
-        StructField("is_valid", BooleanType(), nullable=False),
+        StructField("debit_credit_indicator", StringType(), nullable=True),
+        StructField("cost_center", StringType(), nullable=True),
+        StructField("source_system", StringType(), nullable=True),
+        StructField("load_ts", TimestampType(), nullable=True),
         # --- Audit timestamp of when the row was cleansed ---
         StructField("cleansed_at", TimestampType(), nullable=True),
     ]
@@ -121,39 +125,72 @@ STAGING_1_SCHEMA: StructType = StructType(
 
 
 # ---------------------------------------------------------------------------
-# staging_2 — account-by-month aggregated output of an "enrich / aggregate"
-# stored procedure. Feeds ``schemas/output_tables.py``: one row per
-# (account_id, activity_month) carrying rolled-up debit / credit / net amounts
-# and activity counts.
+# staging_2_enriched — enriched output of the "enrich accounts" stored procedure
+# (``dbo.usp_enrich_accounts``). The cleansed rows decorated with account master
+# attributes (``account_name``, ``account_type``) that ``staging_3_balances`` and
+# the final ``dim_account_snapshot`` consume. Manifest hash columns:
+# (gl_entry_id, account_id, posting_date, amount, currency_code); key: gl_entry_id.
 # ---------------------------------------------------------------------------
-STAGING_2_SCHEMA: StructType = StructType(
+STAGING_2_ENRICHED: StructType = StructType(
     [
-        # --- Grouping keys ---
+        # --- Financial-identity anchors (non-nullable) ---
+        StructField("gl_entry_id", StringType(), nullable=False),
+        StructField("journal_id", StringType(), nullable=True),
         StructField("account_id", StringType(), nullable=False),
-        StructField("customer_id", StringType(), nullable=True),
-        # --- Aggregation period as "YYYY-MM" (mandatory grouping key) ---
-        StructField("activity_month", StringType(), nullable=False),
-        # --- Rolled-up monetary aggregates (exact decimal; may be null when no
-        #     debit / credit activity exists for the period) ---
+        StructField("posting_date", DateType(), nullable=False),
         StructField(
-            "total_debit_amount",
+            "amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=False
+        ),
+        # --- Descriptive / provenance attributes ---
+        StructField("currency_code", StringType(), nullable=True),
+        StructField("debit_credit_indicator", StringType(), nullable=True),
+        StructField("cost_center", StringType(), nullable=True),
+        StructField("source_system", StringType(), nullable=True),
+        StructField("load_ts", TimestampType(), nullable=True),
+        # --- Account master attributes added by enrichment ---
+        StructField("account_name", StringType(), nullable=True),
+        StructField("account_type", StringType(), nullable=True),
+        # --- Audit timestamp of when the row was enriched ---
+        StructField("enriched_at", TimestampType(), nullable=True),
+    ]
+)
+
+
+# ---------------------------------------------------------------------------
+# staging_3_balances — balances output of the "compute balances" stored procedure
+# (``dbo.usp_compute_balances``): one row per ``(account_id, posting_date)`` with
+# the rolled-up closing balance, debit / credit subtotals, and an entry count.
+# Manifest hash columns: (account_id, posting_date, balance_amount, currency_code,
+# cost_center); composite key: (account_id, posting_date).
+# ---------------------------------------------------------------------------
+STAGING_3_BALANCES: StructType = StructType(
+    [
+        # --- Composite key (non-nullable) ---
+        StructField("account_id", StringType(), nullable=False),
+        StructField("posting_date", DateType(), nullable=False),
+        # --- Attribution / currency (part of the parity hash) ---
+        StructField("cost_center", StringType(), nullable=True),
+        StructField("currency_code", StringType(), nullable=True),
+        # --- Computed closing balance (exact decimal, mandatory) ---
+        StructField(
+            "balance_amount",
             DecimalType(_MONEY_PRECISION, _MONEY_SCALE),
-            nullable=True,
+            nullable=False,
+        ),
+        # --- Carried account attributes (feed dim_account_snapshot) ---
+        StructField("account_name", StringType(), nullable=True),
+        StructField("account_type", StringType(), nullable=True),
+        # --- Rolled-up debit / credit subtotals (may be null when no activity) ---
+        StructField(
+            "debit_amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=True
         ),
         StructField(
-            "total_credit_amount",
-            DecimalType(_MONEY_PRECISION, _MONEY_SCALE),
-            nullable=True,
+            "credit_amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=True
         ),
-        StructField(
-            "net_amount", DecimalType(_MONEY_PRECISION, _MONEY_SCALE), nullable=True
-        ),
-        # --- Activity counts: total transactions is mandatory (>= 0) ---
-        StructField("transaction_count", LongType(), nullable=False),
-        StructField("distinct_merchant_count", IntegerType(), nullable=True),
-        # --- First / last transaction dates within the period ---
-        StructField("first_transaction_date", DateType(), nullable=True),
-        StructField("last_transaction_date", DateType(), nullable=True),
+        # --- Count of contributing GL entries (mandatory, >= 0) ---
+        StructField("entry_count", LongType(), nullable=False),
+        # --- Audit timestamp of when the balance was computed ---
+        StructField("computed_at", TimestampType(), nullable=True),
     ]
 )
 
@@ -161,15 +198,17 @@ STAGING_2_SCHEMA: StructType = StructType(
 # ---------------------------------------------------------------------------
 # Registry: intermediate staging table name -> explicit StructType.
 #
-# Jobs resolve their output schema by the table name declared in the pipeline
-# manifest, so extending the chain is a one-line addition here (plus the new
-# ``STAGING_<n>_SCHEMA`` above) with zero consumer-code changes.
+# Keys MUST match the staging table names declared in the pipeline manifest
+# (``config/pipeline_manifest.yaml``). Jobs resolve their output schema by the
+# manifest table name, so extending the chain is a one-line addition here (plus
+# the new ``STAGING_<n>_*`` definition above) with zero consumer-code changes.
 # ``schemas/__init__.py`` re-exports this mapping and merges it into the unified
 # ``ALL_SCHEMAS`` registry.
 # ---------------------------------------------------------------------------
 STAGING_SCHEMAS: Dict[str, StructType] = {
-    "staging_1": STAGING_1_SCHEMA,
-    "staging_2": STAGING_2_SCHEMA,
+    "staging_1_cleansed": STAGING_1_CLEANSED,
+    "staging_2_enriched": STAGING_2_ENRICHED,
+    "staging_3_balances": STAGING_3_BALANCES,
 }
 
 
@@ -181,7 +220,8 @@ def get_staging_schema(table_name: str) -> StructType:
     ``staging_<n>`` table named in the pipeline manifest.
 
     Args:
-        table_name: The intermediate staging table name, e.g. ``"staging_1"``.
+        table_name: The intermediate staging table name, e.g.
+            ``"staging_1_cleansed"``.
 
     Returns:
         The :class:`StructType` registered for ``table_name``.
@@ -203,8 +243,9 @@ def get_staging_schema(table_name: str) -> StructType:
 
 
 __all__ = [
-    "STAGING_1_SCHEMA",
-    "STAGING_2_SCHEMA",
+    "STAGING_1_CLEANSED",
+    "STAGING_2_ENRICHED",
+    "STAGING_3_BALANCES",
     "STAGING_SCHEMAS",
     "get_staging_schema",
 ]

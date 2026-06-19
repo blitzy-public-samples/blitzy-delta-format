@@ -1,5 +1,5 @@
 #
-# Copyright (2021) The Delta Lake Project Authors.
+# Copyright (2024) The Delta Lake Project Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -28,16 +28,26 @@ hash. The package initializer (``schemas/__init__.py``) re-exports
 :data:`OUTPUT_SCHEMAS` and folds it into the repository-wide ``ALL_SCHEMAS``
 registry.
 
-Reconciliation directive
--------------------------
-The authoritative set of output tables, their columns, each table's write mode
-(``merge`` upsert vs. ``overwrite`` truncate-and-reload), and the merge
-conditions are defined in the YAML manifest at ``config/pipeline_manifest``
-(parsed at runtime by ``lib/manifest.py``). The two tables defined here --
-``fact_account_monthly_summary`` (a ``merge``/upsert target) and
-``dim_customer`` (an ``overwrite`` truncate-and-reload target) -- are an
-*illustrative finance template*. Align their names, columns, and key fields
-with the manifest before production cutover.
+Authoritative reconciliation
+-----------------------------
+The set of output tables, their columns, each table's write mode (``merge``
+upsert vs. ``overwrite`` truncate-and-reload), and the merge conditions are
+defined in the YAML manifest at ``config/pipeline_manifest.yaml`` (parsed at
+runtime by ``lib/manifest.py``). The two tables defined here are reconciled 1:1
+to that manifest's output catalog:
+
+* :data:`FACT_GENERAL_LEDGER` (table ``fact_general_ledger``) — the GL fact at
+  entry grain, written with ``merge`` (upsert) on the composite key
+  ``(gl_entry_id, posting_date)``. Both merge-key columns are declared
+  ``nullable=False`` so a NULL key can never silently match or duplicate a row
+  during the upsert.
+* :data:`DIM_ACCOUNT_SNAPSHOT` (table ``dim_account_snapshot``) — the account
+  dimension snapshot, written with ``overwrite`` (truncate-and-reload).
+  ``account_id`` is the natural key and is declared ``nullable=False``.
+
+Each symbol name matches the ``schema.symbol`` the manifest references for that
+table, and each table carries every column the manifest's
+``parity.hash_columns`` and ``parity.key_columns`` reference for it.
 
 Parity note (Gate 1)
 --------------------
@@ -69,8 +79,6 @@ from typing import Dict
 from pyspark.sql.types import (
     DateType,
     DecimalType,
-    IntegerType,
-    LongType,
     StringType,
     StructField,
     StructType,
@@ -85,51 +93,55 @@ from pyspark.sql.types import (
 # that writes are deterministic and the Gate 1 parity hash is reproducible.
 # ---------------------------------------------------------------------------
 
-# ``fact_account_monthly_summary`` -- monthly per-account rollup fact table.
+# ``fact_general_ledger`` -- GL fact table at entry grain.
 #
-# Write mode: ``merge`` (upsert). The manifest-defined merge key is the
-# composite ``(account_id, activity_month)``; both key columns are therefore
-# declared ``nullable=False`` so a NULL key can never silently match or
-# duplicate a row during the upsert. Column lineage: this table is derived from
-# the aggregated ``staging_2`` table (see ``schemas/staging_tables.py``).
-FACT_ACCOUNT_MONTHLY_SUMMARY_SCHEMA: StructType = StructType(
+# Write mode: ``merge`` (upsert). The manifest-defined merge key is the composite
+# ``(gl_entry_id, posting_date)``; BOTH key columns are therefore declared
+# ``nullable=False`` so a NULL key can never silently match or duplicate a row
+# during the upsert. Manifest hash columns: (gl_entry_id, account_id,
+# posting_date, amount, currency_code). Column lineage: derived from the
+# ``staging_3_balances`` / enriched GL rows (see ``schemas/staging_tables.py``).
+FACT_GENERAL_LEDGER: StructType = StructType(
     [
-        # --- Merge / business keys (manifest merge key: account_id + activity_month) ---
+        # --- Merge / business keys (manifest merge key: gl_entry_id + posting_date) ---
+        StructField("gl_entry_id", StringType(), nullable=False),
+        StructField("posting_date", DateType(), nullable=False),
+        # --- Identity / account anchors ---
+        StructField("journal_id", StringType(), nullable=True),
         StructField("account_id", StringType(), nullable=False),
-        StructField("customer_id", StringType(), nullable=True),
-        # "YYYY-MM" calendar-month bucket the summary belongs to.
-        StructField("activity_month", StringType(), nullable=False),
-        # --- Monetary measures: fixed-precision Decimal for reproducible hashing ---
-        StructField("total_debit_amount", DecimalType(18, 2), nullable=True),
-        StructField("total_credit_amount", DecimalType(18, 2), nullable=True),
-        StructField("net_amount", DecimalType(18, 2), nullable=True),
-        # --- Count measures ---
-        StructField("transaction_count", LongType(), nullable=False),
-        StructField("distinct_merchant_count", IntegerType(), nullable=True),
-        # --- Activity window ---
-        StructField("first_transaction_date", DateType(), nullable=True),
-        StructField("last_transaction_date", DateType(), nullable=True),
+        # --- Monetary measure: fixed-precision Decimal for reproducible hashing ---
+        StructField("amount", DecimalType(18, 2), nullable=False),
+        # --- Descriptive / provenance attributes ---
+        StructField("currency_code", StringType(), nullable=True),
+        StructField("debit_credit_indicator", StringType(), nullable=True),
+        StructField("cost_center", StringType(), nullable=True),
+        StructField("account_name", StringType(), nullable=True),
+        StructField("account_type", StringType(), nullable=True),
+        StructField("source_system", StringType(), nullable=True),
+        StructField("load_ts", TimestampType(), nullable=True),
         # --- Lineage / audit ---
         StructField("load_run_id", StringType(), nullable=True),
         StructField("load_timestamp", TimestampType(), nullable=True),
     ]
 )
 
-# ``dim_customer`` -- customer dimension table.
+# ``dim_account_snapshot`` -- account dimension snapshot.
 #
-# Write mode: ``overwrite`` (truncate-and-reload). ``customer_id`` is the
-# natural business key and is declared ``nullable=False``; the remaining
-# columns are derived aggregates and audit metadata.
-DIM_CUSTOMER_SCHEMA: StructType = StructType(
+# Write mode: ``overwrite`` (truncate-and-reload). ``account_id`` is the natural
+# business key and is declared ``nullable=False``. Manifest hash columns:
+# (account_id, account_name, account_type, cost_center, currency_code).
+DIM_ACCOUNT_SNAPSHOT: StructType = StructType(
     [
         # --- Business key ---
-        StructField("customer_id", StringType(), nullable=False),
-        # --- Aggregate measures ---
-        StructField("account_count", IntegerType(), nullable=True),
-        StructField("total_lifetime_net_amount", DecimalType(18, 2), nullable=True),
-        # --- Activity window ---
-        StructField("first_seen_date", DateType(), nullable=True),
-        StructField("last_seen_date", DateType(), nullable=True),
+        StructField("account_id", StringType(), nullable=False),
+        # --- Account master attributes (part of the parity hash) ---
+        StructField("account_name", StringType(), nullable=True),
+        StructField("account_type", StringType(), nullable=True),
+        StructField("cost_center", StringType(), nullable=True),
+        StructField("currency_code", StringType(), nullable=True),
+        # --- Provenance / snapshot window ---
+        StructField("source_system", StringType(), nullable=True),
+        StructField("snapshot_date", DateType(), nullable=True),
         # --- Lineage / audit ---
         StructField("load_run_id", StringType(), nullable=True),
         StructField("load_timestamp", TimestampType(), nullable=True),
@@ -142,10 +154,10 @@ DIM_CUSTOMER_SCHEMA: StructType = StructType(
 
 # Authoritative registry mapping each final output table name to its explicit
 # schema. Keys MUST match the output-table names declared in the manifest at
-# ``config/pipeline_manifest``. Re-exported by ``schemas/__init__.py``.
+# ``config/pipeline_manifest.yaml``. Re-exported by ``schemas/__init__.py``.
 OUTPUT_SCHEMAS: Dict[str, StructType] = {
-    "fact_account_monthly_summary": FACT_ACCOUNT_MONTHLY_SUMMARY_SCHEMA,
-    "dim_customer": DIM_CUSTOMER_SCHEMA,
+    "fact_general_ledger": FACT_GENERAL_LEDGER,
+    "dim_account_snapshot": DIM_ACCOUNT_SNAPSHOT,
 }
 
 
@@ -159,7 +171,7 @@ def get_output_schema(table_name: str) -> StructType:
 
     Args:
         table_name: Logical output-table name exactly as keyed in
-            :data:`OUTPUT_SCHEMAS` (for example, ``"dim_customer"``).
+            :data:`OUTPUT_SCHEMAS` (for example, ``"dim_account_snapshot"``).
 
     Returns:
         The :class:`~pyspark.sql.types.StructType` registered for the table.
@@ -179,8 +191,8 @@ def get_output_schema(table_name: str) -> StructType:
 
 
 __all__ = [
-    "FACT_ACCOUNT_MONTHLY_SUMMARY_SCHEMA",
-    "DIM_CUSTOMER_SCHEMA",
+    "FACT_GENERAL_LEDGER",
+    "DIM_ACCOUNT_SNAPSHOT",
     "OUTPUT_SCHEMAS",
     "get_output_schema",
 ]
