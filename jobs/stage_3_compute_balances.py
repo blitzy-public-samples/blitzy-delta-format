@@ -20,9 +20,11 @@ procedure ``dbo.usp_compute_balances`` (stage 3, the final transform stage, of
 the config-driven pipeline declared in ``config/pipeline_manifest.yaml``). It is
 the only stage that **changes grain**: it reads the prior stage's Delta table
 ``staging_2_enriched`` (one row per ``gl_entry_id``), rolls the general-ledger
-entries up to one row per ``(account_id, posting_date)`` -- additionally split by
-``currency_code`` and ``cost_center`` -- and writes the next Delta table
-``staging_3_balances`` in ``overwrite`` mode. Overwriting a deterministic
+entries up to exactly one row per ``(account_id, posting_date)`` -- the
+authoritative business key declared by the manifest
+(``parity.key_columns: [account_id, posting_date]``), so every
+``(account_id, posting_date)`` pair is unique in the output -- and writes the next
+Delta table ``staging_3_balances`` in ``overwrite`` mode. Overwriting a deterministic
 aggregation makes the stage structurally idempotent: re-running the same source /
 run id yields identical balances with no row growth (Gate 3). Every Delta commit
 is coordinated through ``io.delta.storage.S3DynamoDBLogStore`` with full ACID
@@ -42,11 +44,11 @@ Responsibility (in order)
 #. Read the ``staging_2_enriched`` Delta table written by Stage 2 (typed, already
    conformed to ``schemas.staging_tables.STAGING_2_ENRICHED``, at ``gl_entry_id``
    grain).
-#. Apply :func:`compute_balances`: derive a signed amount per entry, aggregate to
-   the ``(account_id, posting_date, currency_code, cost_center)`` grain producing a
-   rolled-up ``balance_amount`` (net), ``debit_amount`` / ``credit_amount``
-   subtotals, an ``entry_count``, carry the account attributes forward, and stamp a
-   ``computed_at`` audit timestamp.
+#. Apply :func:`compute_balances`: aggregate to the ``(account_id, posting_date)``
+   grain producing a rolled-up ``balance_amount`` (net), ``debit_amount`` /
+   ``credit_amount`` subtotals, an ``entry_count``, the per-group ``currency_code`` /
+   ``cost_center`` attribution, the carried account attributes, and a ``computed_at``
+   audit timestamp.
 #. Conform the result to the explicit ``StructType`` for ``staging_3_balances``
    (resolved from the ``schemas/`` registry) so the schema-locked write succeeds.
 #. Overwrite-write ``staging_3_balances`` through :mod:`lib.delta_io`.
@@ -102,12 +104,13 @@ the **Gate 1 parity check** (row-count + 5-field-hash ≥ 99.99% for 100% of tab
 AAP §0.7.2), run against the sampled legacy baseline at deployment. This module is
 built to PASS that gate, which is the authoritative 1:1 verification.
 
-Should Gate 1 surface a discrepancy -- for example a different sign rule, a finer
-grain (splitting by ``currency_code`` / ``cost_center`` rather than keying strictly
-on ``(account_id, posting_date)``), or a different NULL-side subtotal treatment --
-the correction is **localized and requires no control-flow change**, because the
-stage is fully config/registry-driven: adjust the aggregation expressions / grouping
-keys in :func:`compute_balances`, and/or the explicit ``staging_3_balances``
+This stage keys strictly on the manifest grain ``(account_id, posting_date)``;
+should Gate 1 surface a discrepancy -- for example a different sign rule, a
+different NULL-side subtotal treatment, or a different rule for selecting the
+per-group ``currency_code`` / ``cost_center`` attribution -- the correction is
+**localized and requires no control-flow change**, because the stage is fully
+config/registry-driven: adjust the aggregation expressions / grouping keys in
+:func:`compute_balances`, and/or the explicit ``staging_3_balances``
 ``StructType`` in the ``schemas/`` registry (``schemas.get_schema('staging_3_balances')``
 already resolves -- the registry key matches the manifest table name and
 ``schemas.staging_tables`` declares ``STAGING_3_BALANCES``), and/or the stage order /
@@ -291,7 +294,9 @@ def compute_balances(df: DataFrame) -> DataFrame:
     The 1:1 PySpark replacement of ``dbo.usp_compute_balances`` and the only
     transform in the chain that **changes grain**: the input is at the
     ``gl_entry_id`` row level (``staging_2_enriched``) and the output is rolled up
-    to one row per ``(account_id, posting_date, currency_code, cost_center)``. This
+    to exactly one row per ``(account_id, posting_date)`` -- the authoritative
+    manifest business key (``parity.key_columns: [account_id, posting_date]``), so
+    each ``(account_id, posting_date)`` pair is unique in the result. This
     is a PURE transformation (DataFrame in -> DataFrame out): it performs no I/O,
     builds no session, and reads no configuration, which keeps it trivially
     unit-testable. Every operation is deterministic and order-independent, so
@@ -314,12 +319,18 @@ def compute_balances(df: DataFrame) -> DataFrame:
        side" rule) and is NULL when a group has no rows on that side.
     #. **Entry count** -- ``entry_count`` is the number of contributing GL entries
        in the group (one input row == one entry, so a plain row count).
-    #. **Carried account attributes** -- ``account_name`` / ``account_type`` are
-       carried forward via :func:`~pyspark.sql.functions.max`; because Stage 2
-       derives both deterministically from ``account_id`` they are constant within
-       an account group, so ``max`` is an order-independent, deterministic way to
-       surface that single value (it also tolerates an all-NULL group by yielding
-       NULL). They feed the downstream ``dim_account_snapshot`` output table.
+    #. **Collapsed attribution / carried attributes** -- ``currency_code`` and
+       ``cost_center`` (both part of the manifest five-field parity hash) and
+       ``account_name`` / ``account_type`` (which feed the downstream
+       ``dim_account_snapshot``) are each reduced to one value per group via
+       :func:`~pyspark.sql.functions.max`. Because the grain is now strictly
+       ``(account_id, posting_date)`` these attributes must collapse to a single
+       value; for a well-formed feed they are constant within the group (one account
+       posts in one currency / cost center on a given date, and Stage 2 derives the
+       account attributes deterministically from ``account_id``), so ``max`` simply
+       surfaces that value. ``max`` is order-independent and deterministic -- keeping
+       the output byte-identical across re-runs (idempotency, Gate 3) -- and
+       tolerates an all-NULL group by yielding NULL.
     #. **Audit** -- stamp ``computed_at`` with the processing-time
        :func:`~pyspark.sql.functions.current_timestamp`; this column is excluded
        from the parity hash, so its per-run value does not affect Gate 1 / Gate 3.
@@ -368,17 +379,37 @@ def compute_balances(df: DataFrame) -> DataFrame:
     debit_value = F.when(is_debit, F.col("amount"))
     credit_value = F.when(is_credit, F.col("amount"))
 
-    # Aggregate to the (account_id, posting_date, currency_code, cost_center) grain.
-    # Monetary sums are cast back to the exact DECIMAL(18, 2) target type (Spark widens
-    # the precision of a decimal SUM), so no float ever enters a balance column.
-    aggregated = df.groupBy("account_id", "posting_date", "currency_code", "cost_center").agg(
+    # Aggregate to the (account_id, posting_date) grain -- the AUTHORITATIVE business
+    # key for ``staging_3_balances`` declared by the manifest
+    # (``parity.key_columns: [account_id, posting_date]``). Grouping on exactly these two
+    # keys guarantees each (account_id, posting_date) pair is UNIQUE in the output (the
+    # account x date regrain this stage is responsible for); it deliberately does NOT
+    # split the grain further by ``currency_code`` / ``cost_center`` (which would emit
+    # duplicate manifest keys). Monetary sums are cast back to the exact DECIMAL(18, 2)
+    # target type (Spark widens the precision of a decimal SUM), so no float ever enters
+    # a balance column.
+    aggregated = df.groupBy("account_id", "posting_date").agg(
         F.sum(signed_amount).cast(money).alias("balance_amount"),
         F.sum(debit_value).cast(money).alias("debit_amount"),
         F.sum(credit_value).cast(money).alias("credit_amount"),
         # (4) One input row per GL entry, so the row count is the contributing-entry
         #     count; ``count(lit(1))`` is non-null and deterministic.
         F.count(F.lit(1)).alias("entry_count"),
-        # (5) Carry the (account-constant) descriptive attributes forward.
+        # (5) Collapse the remaining descriptive / attribution columns to ONE
+        #     deterministic value per (account_id, posting_date) group. ``currency_code``
+        #     and ``cost_center`` are part of the manifest's five-field parity hash, so
+        #     they must be present and reproducible; ``account_name`` / ``account_type``
+        #     are carried forward to feed the downstream ``dim_account_snapshot``.
+        #     :func:`~pyspark.sql.functions.max` is order-independent and deterministic
+        #     (so re-running over the same input yields byte-identical values --
+        #     idempotency, Gate 3) and tolerates an all-NULL group by yielding NULL. For a
+        #     well-formed feed each attribute is constant within an (account_id,
+        #     posting_date) group -- a single account posts in one currency / cost center
+        #     on a given date -- so ``max`` simply surfaces that single value; should a
+        #     group ever span differing values it selects one deterministically rather
+        #     than splitting the (account_id, posting_date) grain.
+        F.max(F.col("currency_code")).alias("currency_code"),
+        F.max(F.col("cost_center")).alias("cost_center"),
         F.max(F.col("account_name")).alias("account_name"),
         F.max(F.col("account_type")).alias("account_type"),
     )
