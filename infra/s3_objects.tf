@@ -24,7 +24,7 @@
 # created/modified here -- only new prefix-scoped objects are added:
 #
 #   ARTIFACT_S3_BUCKET (var.artifact_s3_bucket)
-#     - the two staged Delta JARs        -> ${local.jar_prefix}/
+#     - the three staged Delta JARs      -> ${local.jar_prefix}/
 #     - the staged delta-spark wheel      -> ${local.wheel_prefix}/
 #     - the five Glue job scripts         -> ${local.code_prefix}/jobs/
 #     - the zipped lib/ + schemas/ pkgs   -> ${local.code_prefix}/
@@ -44,9 +44,9 @@
 # SINGLE SOURCE OF TRUTH: every object KEY is built from the prefix locals in
 # infra/locals.tf (jar_prefix, wheel_prefix, code_prefix, config_prefix,
 # mwaa_dag_prefix, mwaa_dag_config_prefix) and the staged-binary filename locals
-# (delta_spark_jar, delta_storage_jar, delta_wheel). infra/glue_jobs.tf builds
-# its Glue argument S3 URIs from the SAME locals, so the upload location and the
-# runtime reference can never drift apart.
+# (delta_spark_jar, delta_storage_jar, delta_storage_transitive_jar, delta_wheel).
+# infra/glue_jobs.tf builds its Glue argument S3 URIs from the SAME locals, so the
+# upload location and the runtime reference can never drift apart.
 #
 # DRIFT (Gate 4): every object sets `etag` to the md5 of its content
 # (filemd5(...) for files on disk, the archive data source's output_md5 for the

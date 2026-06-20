@@ -120,6 +120,22 @@ before production cutover.
   classes (see the *Runtime class-closure note* at the top); it is wired through
   `infra/locals.tf` → `infra/s3_objects.tf` → `infra/glue_jobs.tf` exactly like
   the other two JARs.
+- **AAP traceability (§0.5.1 Group H ↔ §0.7.3 "implied artifact").** AAP §0.5.1
+  Group H literally enumerates **two** JARs (`delta-spark_2.12-3.2.0.jar`,
+  `delta-storage-s3-dynamodb-3.2.0.jar`) plus the wheel. The **third** JAR staged
+  here, `delta-storage-3.2.0.jar`, is an *implied-required* artifact under the very
+  same principle the AAP itself applies in **§0.7.3** to stage the `delta-spark`
+  wheel beyond the prompt's literal JAR-only list: the mandated
+  `io.delta.storage.S3DynamoDBLogStore` cannot class-load without it (its
+  `BaseExternalLogStore` superclass `io.delta.storage.HadoopFileSystemLogStore` and
+  the `io.delta.storage.internal.{PathLock,FileNameUtils}` helpers live **only** in
+  this base JAR), and **§0.1.2** prohibits resolving it from public Maven at
+  runtime. Net binary count is therefore **3 JARs (2 enumerated + 1
+  implied-required) + 1 wheel = 4 binaries**; reducing to 2 JARs would raise
+  `NoClassDefFoundError` at the first Delta commit. The frozen AAP §0.5.1 Group H
+  text is the plan of record and is **not edited** by this feature; this note
+  reconciles the implementation to it within the deliverable, per the Minimal
+  Change Mandate (document, don't silently change).
 
 ---
 
