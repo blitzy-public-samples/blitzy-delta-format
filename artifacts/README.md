@@ -94,9 +94,11 @@ bytes and reconciled with the upstream source.
 > **⚠️ Validation Item (AAP §0.3.3, §0.7.3) — platform-team confirmation required.**
 >
 > The Delta Lake 3.x line — **including `delta-spark` 3.2.0** — is published
-> against the **Apache Spark 3.5.x** line, whereas **AWS Glue 4.0 ships Apache
-> Spark 3.3.x**. The versions pinned by this feature (Delta 3.2.0 on Glue 4.0)
-> are **authoritative inputs from the prompt** and are staged here **verbatim**.
+> against the **Apache Spark 3.5.x** line; the staged wheel's own `METADATA`
+> declares `Requires-Dist: pyspark (<3.6.0,>=3.5.0)`, confirming this pin. **AWS
+> Glue 4.0**, by contrast, **ships Apache Spark 3.3.x**. The versions pinned by
+> this feature (Delta 3.2.0 on Glue 4.0) are **authoritative inputs from the
+> prompt** and are staged here **verbatim**.
 >
 > This tension **must be confirmed with the platform team — or a coordinated
 > version adjustment escalated — before production cutover.** Per the Minimal

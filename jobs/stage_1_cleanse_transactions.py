@@ -36,8 +36,10 @@ Responsibility (in order)
 #. Apply :func:`cleanse_transactions`: trim string columns, uppercase the ISO-4217
    ``currency_code``, normalize ``debit_credit_indicator`` to a canonical ``D`` /
    ``C``, keep ``amount`` as an exact :class:`~pyspark.sql.types.DecimalType`
-   (18, 2), stamp a ``cleansed_at`` audit timestamp, and drop structurally-invalid
-   rows (missing business keys).
+   (18, 2), stamp a ``cleansed_at`` audit timestamp, and emit a derived
+   ``is_valid`` Boolean validity indicator. The stage is row-count-preserving:
+   structurally-invalid rows (missing business keys) are flagged via ``is_valid``,
+   never silently dropped.
 #. Conform the result to the explicit ``StructType`` for ``staging_1_cleansed``
    (resolved from the ``schemas/`` registry) so the schema-locked write succeeds.
 #. Overwrite-write ``staging_1_cleansed`` through :mod:`lib.delta_io`.
@@ -67,7 +69,7 @@ Reconciliation note (PROMINENT)
 The exact cleanse logic MUST be reconciled 1:1 with the real
 ``dbo.usp_cleanse_transactions`` definition before production cutover; the
 operations in :func:`cleanse_transactions` are a representative finance template
-(trim / case-fold / indicator-normalize / decimal-cast / drop-missing-keys), not
+(trim / case-fold / indicator-normalize / decimal-cast / validity-flagging), not
 the verified procedure body. The ``schemas/`` registry key and columns for
 ``staging_1_cleansed`` must likewise be reconciled so that
 ``schemas.get_schema('staging_1_cleansed')`` resolves -- as authored it does (the

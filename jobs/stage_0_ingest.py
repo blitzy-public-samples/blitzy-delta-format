@@ -296,9 +296,7 @@ def main() -> None:
         # ``YYYY-MM-DD`` calendar date before appending it -- so an unsafe or
         # traversal run_date can never smuggle extra path levels (CWE-22).
         run_date = args.get("run_date", "")
-        quarantine_path = build_quarantine_uri(
-            args["quarantine_s3_path"], out_table_name, run_date
-        )
+        quarantine_path = build_quarantine_uri(args["quarantine_s3_path"], out_table_name, run_date)
 
         threshold = float(args["bad_record_threshold"])
 
