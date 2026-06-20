@@ -26,10 +26,18 @@ absolute ``from lib.x import ...`` / ``from schemas import ...`` imports.
 
 Responsibility (in order)
 -------------------------
-#. Read the delimited flat files at ``--source_s3_path`` using the per-pipeline
-   source contract (delimiter / quote / null token / header / encoding) and an
-   explicit, all-``StringType`` read schema (plus the PERMISSIVE-mode
-   ``_corrupt_record`` column) -- never inferred.
+#. Resolve and VALIDATE the effective source location, then read the delimited
+   flat files there using the per-pipeline source contract (delimiter / quote /
+   null token / header / encoding) and an explicit, all-``StringType`` read
+   schema (plus the PERMISSIVE-mode ``_corrupt_record`` column) -- never
+   inferred. The effective source is ``--source_s3_path`` (the Terraform-
+   provided, IAM-scoped source root) unless a non-empty
+   ``--source_s3_path_override`` is supplied, in which case the override is
+   validated AND confined to the approved source bucket / prefix (see
+   :func:`lib.s3_paths.resolve_source_uri`). Both paths reject empty values,
+   non-``s3a``/``s3`` schemes, embedded schemes, backslashes, control characters,
+   and ``..`` traversal (CWE-22); an invalid source path fails the job non-zero
+   before any read.
 #. Validate / safe-cast every row against the explicit typed ``StructType`` for
    ``staging_raw`` (from the ``schemas/`` registry); split conforming rows from
    malformed ones.
@@ -77,9 +85,12 @@ Job arguments (injected by ``infra/glue_jobs.tf``)
 Required: ``JOB_NAME`` (Glue-provided), ``ddb_table_name``, ``aws_region``,
 ``delta_bucket`` (DELTA_S3_BUCKET, no scheme), ``manifest_path``, ``step`` (this
 stage's unique manifest token, e.g. ``stage-0-ingest``), ``source_s3_path``
-(``s3a://...``), ``source_contract_path``, ``quarantine_s3_path`` (``s3a://...``
-root). Optional-with-default: ``bad_record_threshold`` (``"0.0"``), ``run_date``
-(``""``).
+(``s3a://...`` -- the configured, IAM-scoped source root supplied by Terraform
+``default_arguments``), ``source_contract_path``, ``quarantine_s3_path``
+(``s3a://...`` root). Optional-with-default: ``bad_record_threshold`` (``"0.0"``),
+``run_date`` (``""``), ``source_s3_path_override`` (``""`` -- the optional per-run
+override forwarded by the DAG from ``dag_run.conf['source_s3_path']``; when
+non-empty it must resolve WITHIN the approved ``source_s3_path`` bucket/prefix).
 """
 
 from __future__ import annotations
@@ -92,7 +103,7 @@ from lib.delta_io import count_rows, overwrite_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
-from lib.s3_paths import build_delta_table_uri, build_quarantine_uri
+from lib.s3_paths import build_delta_table_uri, build_quarantine_uri, resolve_source_uri
 from lib.schema_validation import (
     enforce_bad_record_threshold,
     quarantine_bad_records,
@@ -257,7 +268,19 @@ def main() -> None:
             "source_contract_path",
             "quarantine_s3_path",
         ],
-        optional={"bad_record_threshold": "0.0", "run_date": ""},
+        # ``source_s3_path_override`` is the OPTIONAL per-run override forwarded by
+        # the MWAA DAG from ``dag_run.conf['source_s3_path']``. It defaults to ""
+        # (a scheduled run with no override), in which case the effective source is
+        # the Terraform-provided, IAM-scoped ``--source_s3_path`` default. A
+        # non-empty override is validated and CONFINED to the approved source
+        # bucket/prefix by ``resolve_source_uri`` below. Keeping the override in a
+        # SEPARATE argument is what lets the DAG stop passing an empty
+        # ``--source_s3_path`` (which previously clobbered the configured default).
+        optional={
+            "bad_record_threshold": "0.0",
+            "run_date": "",
+            "source_s3_path_override": "",
+        },
     )
     glue_run_id = _resolve_glue_run_id()
     logger = get_logger("stage_0_ingest")
@@ -300,11 +323,27 @@ def main() -> None:
 
         threshold = float(args["bad_record_threshold"])
 
+        # --- Resolve + validate the effective source location BEFORE reading.
+        # ``--source_s3_path`` is the trusted, IAM-scoped source root supplied by
+        # Terraform (s3a://<source-bucket>/<pipeline-source-prefix>);
+        # ``--source_s3_path_override`` is the OPTIONAL per-run override from the
+        # DAG (empty on scheduled runs). ``resolve_source_uri`` validates the
+        # configured default, and -- when an override is present -- validates it
+        # AND confines it to the approved source bucket/prefix, rejecting empty
+        # values, non-s3a/s3 schemes, embedded schemes, backslashes, control
+        # characters, and ``..`` traversal (CWE-22). An invalid source path raises
+        # S3PathError (a ValueError) here and is intentionally NOT caught, so the
+        # Glue job fails fast and non-zero rather than reading an unintended or
+        # empty location.
+        source_s3_path = resolve_source_uri(
+            args["source_s3_path"], args.get("source_s3_path_override", "")
+        )
+
         # Time the data work so the completion event's elapsed_seconds covers
         # read -> validate -> quarantine -> threshold -> write.
         with StageTimer() as timer:
             reader = spark.read.options(**contract.to_spark_csv_options())
-            raw_df = reader.schema(read_schema).csv(args["source_s3_path"])
+            raw_df = reader.schema(read_schema).csv(source_s3_path)
             # Structural failure (a column required by the typed schema is absent)
             # raises SchemaValidationError -- intentionally NOT caught (fatal).
             result = validate_against_schema(raw_df, typed_schema)

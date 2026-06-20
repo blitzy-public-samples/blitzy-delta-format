@@ -74,7 +74,14 @@
 #
 # fileset(..., "**") enumerates every file under the package directory (the
 # packages are flat today, but "**" also future-proofs against sub-packages).
-# `file(...)` reads each module's UTF-8 text content into the archive.
+# The result is FILTERED to ".py" source files only via endswith(...): the Glue
+# runtime needs only the Python modules, and -- critically -- `file(...)` below
+# reads each entry as UTF-8 text, which FAILS on non-UTF-8 bytes. CPython byte
+# caches (__pycache__/*.pyc), produced by any local import/test run, are not
+# valid UTF-8 and previously broke `terraform validate`/`plan`; filtering to .py
+# excludes them (and any other non-source files) deterministically without
+# depending on a clean working tree.
+# `file(...)` reads each retained module's UTF-8 text content into the archive.
 #
 # output_path writes into ${path.module}/.terraform-build/ -- a TRANSIENT build
 # directory that should be git-ignored and is safe to delete between runs; it is
@@ -87,10 +94,12 @@ data "archive_file" "lib_zip" {
   type        = "zip"
   output_path = "${path.module}/.terraform-build/lib.zip"
 
-  # One archive entry per file under ../lib, keyed under the "lib/" prefix so
-  # `import lib.<module>` resolves at the Glue runtime.
+  # One archive entry per .py file under ../lib, keyed under the "lib/" prefix so
+  # `import lib.<module>` resolves at the Glue runtime. Non-source files (notably
+  # __pycache__/*.pyc, which are not valid UTF-8) are excluded so `file(...)`
+  # never tries to read non-UTF-8 bytes -- see the header note above.
   dynamic "source" {
-    for_each = fileset("${path.module}/../lib", "**")
+    for_each = toset([for f in fileset("${path.module}/../lib", "**") : f if endswith(f, ".py")])
     content {
       content  = file("${path.module}/../lib/${source.value}")
       filename = "lib/${source.value}"
@@ -102,10 +111,12 @@ data "archive_file" "schemas_zip" {
   type        = "zip"
   output_path = "${path.module}/.terraform-build/schemas.zip"
 
-  # One archive entry per file under ../schemas, keyed under the "schemas/"
-  # prefix so `import schemas.<module>` resolves at the Glue runtime.
+  # One archive entry per .py file under ../schemas, keyed under the "schemas/"
+  # prefix so `import schemas.<module>` resolves at the Glue runtime. Non-source
+  # files (notably __pycache__/*.pyc, which are not valid UTF-8) are excluded so
+  # `file(...)` never tries to read non-UTF-8 bytes -- see the header note above.
   dynamic "source" {
-    for_each = fileset("${path.module}/../schemas", "**")
+    for_each = toset([for f in fileset("${path.module}/../schemas", "**") : f if endswith(f, ".py")])
     content {
       content  = file("${path.module}/../schemas/${source.value}")
       filename = "schemas/${source.value}"
@@ -121,13 +132,20 @@ data "archive_file" "schemas_zip" {
 # code, and the config YAMLs.
 # ===========================================================================
 
-# The two staged Delta JARs, loaded by Glue via `--extra-jars`:
+# The three staged Delta JARs, loaded by Glue via `--extra-jars`:
 #   - delta-spark_2.12-3.2.0.jar          (Delta Spark connector / DeltaCatalog)
 #   - delta-storage-s3-dynamodb-3.2.0.jar (io.delta.storage.S3DynamoDBLogStore)
+#   - delta-storage-3.2.0.jar             (transitive base: HadoopFileSystemLogStore,
+#                                          CloseableIterator, internal.PathLock,
+#                                          internal.FileNameUtils -- the classes the
+#                                          S3DynamoDBLogStore base extends/uses)
+# The third JAR is REQUIRED for runtime class-closure: with --datalake-formats
+# omitted and public Maven prohibited (AAP 0.7.1), the S3 DynamoDB LogStore cannot
+# class-load without its delta-storage base also on the classpath.
 # Keyed under ${jar_prefix}; the exact filenames come from locals so they match
 # the --extra-jars URIs built in infra/glue_jobs.tf.
 resource "aws_s3_object" "jars" {
-  for_each = toset([local.delta_spark_jar, local.delta_storage_jar])
+  for_each = toset([local.delta_spark_jar, local.delta_storage_jar, local.delta_storage_transitive_jar])
 
   bucket = var.artifact_s3_bucket
   key    = "${local.jar_prefix}/${each.value}"

@@ -34,8 +34,14 @@ Manual trigger ("Trigger DAG w/ config") accepts a JSON ``conf``::
      "source_s3_path": "s3://<source-bucket>/incoming/2024-01-15/"}
 
 - ``run_date``       -> defaults to the run's logical date ({{ ds }}) when absent.
-- ``source_s3_path`` -> defaults to "" (Stage 0's Glue job then falls back to its
-  configured PIPELINE_SOURCE_S3_PREFIX default argument).
+- ``source_s3_path`` -> OPTIONAL per-run override. It is forwarded to Stage 0 as
+  ``--source_s3_path_override`` (the DAG never overrides the job's own
+  ``--source_s3_path``). When omitted it defaults to "" and Stage 0 reads from
+  its configured, IAM-scoped ``--source_s3_path`` (PIPELINE_SOURCE_S3_PREFIX,
+  set in ``infra/glue_jobs.tf``). When supplied it is VALIDATED and CONFINED to
+  the approved source bucket/prefix by Stage 0 before any read, so it may narrow
+  the read to a specific run-date directory within the approved source root but
+  can never redirect it to a different bucket or outside the approved prefix.
 
 Deployment: uploaded to ``MWAA_DAG_S3_BUCKET`` by ``infra/s3_objects.tf``. The
 pre-provisioned MWAA environment itself is untouched. The manifest must be
@@ -46,8 +52,25 @@ surfaces as an Airflow Import Error) rather than silently running a stale
 chain -- this is intentional, loud failure.
 
 Notes for the platform team (documented here, not implemented elsewhere):
-- The MWAA execution role must allow ``glue:StartJobRun`` and
-  ``glue:GetJobRun(s)`` on the Glue jobs created by ``infra/glue_jobs.tf``.
+- MWAA execution-role IAM. The installed ``GlueJobOperator``
+  (``apache-airflow-providers-amazon``) does NOT merely call ``StartJobRun``:
+  its ``execute()`` -> ``GlueJobHook.initialize_job()`` first calls
+  ``get_or_create_glue_job()``, which probes ``glue:GetJob`` (via ``has_job``)
+  and only then calls ``glue:StartJobRun``; with ``wait_for_completion=True`` it
+  subsequently polls ``glue:GetJobRun``. The MWAA execution role must therefore
+  allow the following, SCOPED to the Glue jobs created by ``infra/glue_jobs.tf``
+  (job ARNs ``job/{env}-{domain}-{pipeline_name}-*``):
+    * ``glue:GetJob``      -- job-existence check (``has_job``)
+    * ``glue:StartJobRun`` -- trigger the run
+    * ``glue:GetJobRun``   -- poll for completion
+  ``glue:CreateJob`` is INTENTIONALLY NOT granted: the Glue jobs are owned by
+  Terraform, so the operator's create-if-absent branch must never fire. If a job
+  is ever missing, the ``GetJob``/``CreateJob`` path fails with ``AccessDenied``
+  -- a deliberate guardrail that fails the task loudly instead of letting Airflow
+  shadow-create an unmanaged job. This DAG sets no ``script_location`` /
+  ``create_job_kwargs``, so it never supplies a creation spec. The MWAA
+  environment itself is pre-provisioned and out of scope; this note specifies the
+  role policy the platform team must attach to it.
 - The MWAA task naming convention ``{env}-{domain}-{pipeline_name}-{step}`` is an
   AAP open item to confirm with the platform team; it is used verbatim until
   confirmed.
@@ -173,15 +196,28 @@ _REGION = os.environ.get("AWS_REGION") or os.environ.get("AWS_DEFAULT_REGION")
 
 # Forwarded to EVERY Glue job run as run-time arguments (Jinja-templated from
 # the DAG-run conf). Glue ``getResolvedOptions`` ignores arguments a given job
-# does not declare, so it is safe to pass both to all stages; Stage 0 is the
-# primary ``--source_s3_path`` consumer. ``run_date`` falls back to the run's
-# logical date (``ds``); ``source_s3_path`` falls back to "" so the Stage 0
-# Glue job uses its own configured PIPELINE_SOURCE_S3_PREFIX default. Airflow
-# ``params`` are intentionally NOT declared, because params with empty-string
-# defaults would populate ``conf`` and defeat the ``ds`` fallback.
+# does not declare, so it is safe to pass these to all stages; Stage 0 is the
+# only consumer of the source override. ``run_date`` falls back to the run's
+# logical date (``ds``).
+#
+# CRITICAL -- source-path handling. The DAG forwards the operator-supplied source
+# path ONLY as ``--source_s3_path_override`` and DOES NOT pass ``--source_s3_path``.
+# The configured source root lives in the Stage 0 Glue job's OWN
+# ``--source_s3_path`` default argument (Terraform ``infra/glue_jobs.tf`` -- the
+# IAM-scoped PIPELINE_SOURCE_S3_PREFIX). Because the override is a SEPARATE
+# argument, a scheduled run (no conf) sends ``--source_s3_path_override=""``,
+# which Stage 0 treats as "use the configured ``--source_s3_path``" -- an empty
+# value can no longer clobber the configured default (the prior defect). A manual
+# ``source_s3_path`` supplied in the conf is forwarded as the override and is
+# VALIDATED and CONFINED to the approved source bucket/prefix by Stage 0
+# (``lib.s3_paths.resolve_source_uri``) before any read, rejecting empty values,
+# non-``s3a``/``s3`` schemes, embedded schemes, backslashes, control characters,
+# and ``..`` traversal. Airflow ``params`` are intentionally NOT declared, because
+# params with empty-string defaults would populate ``conf`` and defeat the ``ds``
+# fallback.
 _SCRIPT_ARGS = {
     "--run_date": "{{ dag_run.conf.get('run_date', ds) }}",
-    "--source_s3_path": "{{ dag_run.conf.get('source_s3_path', '') }}",
+    "--source_s3_path_override": "{{ dag_run.conf.get('source_s3_path', '') }}",
 }
 
 # Re-running a stage is idempotent by design (staging tables overwrite, output
@@ -233,8 +269,11 @@ with DAG(
         _task = GlueJobOperator(
             task_id=_resource_name,
             # References the Terraform-owned Glue job by name. No
-            # script_location / iam_role_name / create_job_kwargs are set, so
-            # the operator only triggers the existing job (never creates it).
+            # script_location / iam_role_name / create_job_kwargs are set, so the
+            # operator existence-checks (glue:GetJob) and then triggers the
+            # PRE-EXISTING job; it never supplies a creation spec. CreateJob is
+            # not granted to the MWAA role (see the module docstring's IAM note),
+            # so a missing job fails loudly rather than being shadow-created.
             job_name=_resource_name,
             script_args=_SCRIPT_ARGS,
             region_name=_REGION,

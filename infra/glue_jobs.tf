@@ -137,12 +137,24 @@ locals {
   # gated on the step), keeping each job's argument surface minimal.
   # bad_record_threshold is numeric in the manifest; Glue default_arguments is a
   # map(string), so it is rendered with tostring().
+  #
+  # --source_s3_path is the CONFIGURED, trusted source root and is also the only
+  # source location the Glue execution role is granted to read (infra/iam.tf
+  # scopes reads to source_s3_bucket/pipeline_source_s3_prefix/*). The MWAA DAG
+  # deliberately does NOT override --source_s3_path; instead it forwards an
+  # OPTIONAL per-run override via --source_s3_path_override (default "" here).
+  # Stage 0 (jobs/stage_0_ingest.py -> lib.s3_paths.resolve_source_uri) uses the
+  # override only when non-empty and CONFINES it to this approved bucket/prefix;
+  # an empty override falls back to --source_s3_path. Declaring the override here
+  # with an empty default documents the contract and gives a direct (non-DAG)
+  # Glue console run a well-defined value.
   # -------------------------------------------------------------------------
   glue_stage0_args = {
-    "--source_s3_path"       = local.source_s3_uri            # full s3a:// source root
-    "--source_contract_path" = local.source_contract_basename # localized basename
-    "--quarantine_s3_path"   = local.quarantine_s3_uri        # full s3a:// quarantine root
-    "--bad_record_threshold" = tostring(local.bad_record_threshold)
+    "--source_s3_path"          = local.source_s3_uri            # full s3a:// configured source root (IAM-scoped)
+    "--source_s3_path_override" = ""                             # optional per-run override; DAG sets it from conf
+    "--source_contract_path"    = local.source_contract_basename # localized basename
+    "--quarantine_s3_path"      = local.quarantine_s3_uri        # full s3a:// quarantine root
+    "--bad_record_threshold"    = tostring(local.bad_record_threshold)
   }
 }
 
@@ -195,9 +207,10 @@ resource "aws_glue_job" "stage" {
   # Common args for every stage + the per-stage --step selector + (stage-0 only)
   # the ingest-specific args. --step tells the job which manifest entry to load;
   # JOB_NAME is resolved automatically by Glue and equals this resource `name`.
-  # The DAG additionally passes --run_date (and --source_s3_path) at trigger
-  # time; non-stage-0 jobs simply ignore --source_s3_path because they do not
-  # request it in their getResolvedOptions call.
+  # The DAG additionally passes --run_date and --source_s3_path_override at
+  # trigger time (it does NOT override --source_s3_path); non-stage-0 jobs simply
+  # ignore --source_s3_path_override because they do not request it in their
+  # getResolvedOptions call.
   default_arguments = merge(
     local.glue_common_args,
     { "--step" = each.value.step },

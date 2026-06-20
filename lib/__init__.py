@@ -1,5 +1,5 @@
 #
-# Copyright (2026) The Delta Lake Project Authors.
+# Copyright (2024) The Delta Lake Project Authors.
 #
 # Licensed under the Apache License, Version 2.0 (the "License");
 # you may not use this file except in compliance with the License.
@@ -35,12 +35,21 @@ Submodules (imported explicitly by consumers, never eagerly from this package):
 * ``lib.logging_utils`` -- emit the six-field structured CloudWatch completion
   event (job name, Glue run id, input rows, output rows, bad records, seconds).
 * ``lib.job_args`` -- AWS Glue ``getResolvedOptions`` argument resolution.
+* ``lib.s3_paths`` -- pure-stdlib, import-safe construction and *validation* of
+  every ``s3a://`` Delta / source / quarantine URI a stage composes, closing the
+  CWE-22 (path-traversal) gap by rejecting ``..`` segments, embedded schemes,
+  backslashes, control characters, and empty/absolute path tokens. It is a
+  first-class member of this ``lib`` package (governed by the AAP ``lib/*.py``
+  in-scope wildcard, §0.6.1) and, like ``lib.manifest`` / ``lib.source_contract``,
+  imports neither ``pyspark``, ``delta``, nor ``awsglue`` so it is safe to import
+  from the jobs, the ``validate/`` harness, and unit tests alike.
 
 Design note: this package initializer is intentionally lightweight and performs
 **no** imports of ``pyspark``, ``delta``, or ``awsglue`` at package-import time.
 Those libraries exist only inside the Glue / MWAA runtime, whereas pure-Python
-contexts (the ``validate/`` harness and unit tests) import only
-``lib.manifest`` / ``lib.source_contract``. Keeping this initializer import-free
+contexts (the ``validate/`` harness and unit tests) import only the import-safe,
+stdlib-only submodules (``lib.manifest`` / ``lib.source_contract`` /
+``lib.s3_paths``). Keeping this initializer import-free
 is what lets ``lib`` function as a package in both environments. Consumers import
 the specific submodule they need, for example::
 

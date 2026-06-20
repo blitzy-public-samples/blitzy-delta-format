@@ -123,17 +123,31 @@ locals {
   # -------------------------------------------------------------------------
   delta_spark_jar   = "delta-spark_2.12-3.2.0.jar"
   delta_storage_jar = "delta-storage-s3-dynamodb-3.2.0.jar"
-  delta_wheel       = "delta_spark-3.2.0-py3-none-any.whl"
+  # The S3 DynamoDB LogStore JAR above is NOT self-contained: its
+  # io.delta.storage.S3DynamoDBLogStore -> BaseExternalLogStore base references
+  # io.delta.storage.HadoopFileSystemLogStore, CloseableIterator, and the
+  # io.delta.storage.internal.{PathLock,FileNameUtils} helpers, which live in the
+  # transitive io.delta:delta-storage:3.2.0 artifact. Because --datalake-formats
+  # is deliberately omitted and public Maven is prohibited at runtime (AAP 0.7.1),
+  # that base JAR MUST be staged in ARTIFACT_S3_BUCKET and placed on --extra-jars
+  # too, or the LogStore fails to class-load at job start.
+  delta_storage_transitive_jar = "delta-storage-3.2.0.jar"
+  delta_wheel                  = "delta_spark-3.2.0-py3-none-any.whl"
 
   # -------------------------------------------------------------------------
   # (f) S3 URIs for Glue job arguments (consumed by glue_jobs.tf
   #     default_arguments) plus the source/quarantine runtime roots.
   # -------------------------------------------------------------------------
 
-  # --extra-jars: the two Delta JARs, comma-separated, from ARTIFACT_S3_BUCKET.
+  # --extra-jars: the three Delta JARs, comma-separated, from ARTIFACT_S3_BUCKET.
+  # delta-spark provides the DeltaCatalog / SQL connector; delta-storage-s3-dynamodb
+  # provides S3DynamoDBLogStore; and delta-storage (the transitive base) provides
+  # HadoopFileSystemLogStore + the internal PathLock/FileNameUtils/CloseableIterator
+  # classes the LogStore extends/uses. All three are required on the classpath.
   extra_jars = join(",", [
     "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_spark_jar}",
     "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_storage_jar}",
+    "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_storage_transitive_jar}",
   ])
 
   # --additional-python-modules: the delta-spark wheel from ARTIFACT_S3_BUCKET

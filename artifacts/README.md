@@ -1,14 +1,25 @@
 # artifacts/ — Staged Delta Lake 3.2.0 Binaries
 
-This directory is the **local staging area** for the three **released Delta Lake
+This directory is the **local staging area** for the four **released Delta Lake
 3.2.0** binaries that the additive AWS Glue 4.0 / PySpark ETL feature depends on
 (Technical Specification / AAP §0.5.1 **Group H**). Terraform
 (`infra/s3_objects.tf`) uploads each file from here to `ARTIFACT_S3_BUCKET`,
 because public **PyPI** and **Maven Central** are **prohibited as runtime
 resolution paths** (AAP §0.1.2, §0.3.2). At AWS Glue 4.0 runtime the jobs
 therefore resolve these artifacts **exclusively from `ARTIFACT_S3_BUCKET`** — the
-two JARs via `--extra-jars` and the wheel via `--additional-python-modules`,
+three JARs via `--extra-jars` and the wheel via `--additional-python-modules`,
 wired by `infra/glue_jobs.tf`.
+
+> **Runtime class-closure note.** `delta-storage-s3-dynamodb-3.2.0.jar` is **not
+> self-contained**: its `io.delta.storage.S3DynamoDBLogStore` extends
+> `io.delta.storage.BaseExternalLogStore`, which in turn references
+> `io.delta.storage.HadoopFileSystemLogStore`, `io.delta.storage.CloseableIterator`,
+> and `io.delta.storage.internal.{PathLock,FileNameUtils}`. Those base classes live
+> in the **transitive `io.delta:delta-storage:3.2.0`** artifact. Because
+> `--datalake-formats=delta` is deliberately omitted (`infra/glue_jobs.tf`) and
+> public Maven is prohibited at runtime, that base JAR is staged here too
+> (`delta-storage-3.2.0.jar`) and placed on `--extra-jars`; otherwise the LogStore
+> fails to class-load when the first Delta commit runs.
 
 These are the **published, released** Delta Lake `3.2.0` artifacts. They are
 intentionally **not** built from this monorepo's in-development `4.1.0-SNAPSHOT`
@@ -20,16 +31,17 @@ consumes the prior released line.
 
 ## Inventory & provenance
 
-The `SHA-256` column holds the literal placeholder `<sha256>`; see
-**Filling in the checksums** below for how to populate it at staging time.
-Reference **only** the three filenames staged in this directory — no other
-artifact is in scope.
+The `SHA-256` column records the digest **computed from the actual staged bytes**
+in this directory (see **Filling in the checksums** below for how they are
+produced and how to reconcile them against the upstream source). Reference **only**
+the four filenames staged in this directory — no other artifact is in scope.
 
-| File | Upstream coordinate / source | Version | Scala | Glue arg | SHA-256 |
-|---|---|---|---|---|---|
-| `delta-spark_2.12-3.2.0.jar` | Maven `io.delta:delta-spark_2.12:3.2.0` | 3.2.0 | 2.12 | `--extra-jars` | `<sha256>` |
-| `delta-storage-s3-dynamodb-3.2.0.jar` | Maven `io.delta:delta-storage-s3-dynamodb:3.2.0` | 3.2.0 | n/a | `--extra-jars` | `<sha256>` |
-| `delta_spark-3.2.0-py3-none-any.whl` | PyPI `delta-spark==3.2.0` | 3.2.0 | n/a (py3) | `--additional-python-modules` | `<sha256>` |
+| File | Upstream coordinate / source | Version | Scala | Glue arg | Size (bytes) | SHA-256 |
+|---|---|---|---|---|---|---|
+| `delta-spark_2.12-3.2.0.jar` | Maven `io.delta:delta-spark_2.12:3.2.0` | 3.2.0 | 2.12 | `--extra-jars` | 6111817 | `51d473537d1bc10c81f48b03d8e2a6b604e1b421a70835ec12e917a4245a31d5` |
+| `delta-storage-s3-dynamodb-3.2.0.jar` | Maven `io.delta:delta-storage-s3-dynamodb:3.2.0` | 3.2.0 | n/a | `--extra-jars` | 15606 | `375b202558c1809ba28dfd2f3b3f1e1a51155ceff9561b83f31809800d3759c2` |
+| `delta-storage-3.2.0.jar` | Maven `io.delta:delta-storage:3.2.0` | 3.2.0 | n/a | `--extra-jars` | 24946 | `58aab63eba7736fea9e03eafb0dde6704a34a70f570c1a69ab8e4012c25a95d4` |
+| `delta_spark-3.2.0-py3-none-any.whl` | PyPI `delta-spark==3.2.0` | 3.2.0 | n/a (py3) | `--additional-python-modules` | 21186 | `c4ff3fa7218e58a702cb71eb64384b0005c4d6f0bbdd0fe0b38a53564d946e09` |
 
 **What each binary provides:**
 
@@ -39,30 +51,46 @@ artifact is in scope.
   `io.delta.sql.DeltaSparkSessionExtension` (wired via `spark.sql.extensions`),
   matching the configuration in
   `storage-s3-dynamodb/integration_tests/dynamodb_logstore.py:L118-L124`.
-- `delta-storage-s3-dynamodb-3.2.0.jar` — `io.delta.storage.S3DynamoDBLogStore`,
-  the mandated multi-cluster ACID LogStore.
+- `delta-storage-s3-dynamodb-3.2.0.jar` — `io.delta.storage.S3DynamoDBLogStore`
+  (and its `io.delta.storage.BaseExternalLogStore` base), the mandated
+  multi-cluster ACID LogStore. **Depends on** `delta-storage-3.2.0.jar` below for
+  its base/internal classes.
+- `delta-storage-3.2.0.jar` — the **transitive base** `io.delta:delta-storage`
+  artifact that `delta-storage-s3-dynamodb` is compiled against. It supplies
+  `io.delta.storage.HadoopFileSystemLogStore` (the `BaseExternalLogStore`
+  superclass), `io.delta.storage.CloseableIterator`, and the
+  `io.delta.storage.internal.{PathLock,FileNameUtils}` helpers. Required on
+  `--extra-jars` for the S3 DynamoDB LogStore to class-load at runtime.
 - `delta_spark-3.2.0-py3-none-any.whl` — the Python `delta.tables.DeltaTable`
-  API (including `merge`) used by the Glue PySpark jobs. PyPI project identity
-  `delta_spark` (`setup.py:L39`); `python_requires='>=3.10'` (`setup.py:L36`).
+  API (including `merge`) used by the Glue PySpark jobs. The **staged wheel's own
+  `METADATA`** declares `Name: delta-spark`, `Version: 3.2.0`,
+  `Requires-Python: >=3.6`, and `Requires-Dist: pyspark (<3.6.0,>=3.5.0)`. (This
+  is distinct from — and must not be conflated with — the *current* monorepo
+  `main`, whose `setup.py` declares `python_requires='>=3.10'` for the
+  in-development `4.1.0-SNAPSHOT` line; the staged 3.2.0 wheel's metadata is the
+  authoritative constraint for this artifact.)
 
-### Filling in the checksums
+### Verifying the checksums
 
-The `<sha256>` cells are placeholders. **At staging time a maintainer must
-replace each `<sha256>` with the actual SHA-256 digest of the corresponding
-staged file**, and cross-check it against the upstream published checksum (the
-`.sha256` / `.sha1` sidecar files on Maven Central for the JARs, or the digest
-recorded on the PyPI release page for the wheel). Compute the local digests with:
+The `SHA-256` cells above are **computed from the actual staged bytes** in this
+directory. To re-verify them at any time (for example before a Terraform apply,
+or when reconciling against the upstream published checksum — the `.sha256` /
+`.sha1` sidecar files on Maven Central for the JARs, or the digest recorded on
+the PyPI release page for the wheel), recompute the local digests with:
 
 ```bash
 cd artifacts
 sha256sum \
   delta-spark_2.12-3.2.0.jar \
   delta-storage-s3-dynamodb-3.2.0.jar \
+  delta-storage-3.2.0.jar \
   delta_spark-3.2.0-py3-none-any.whl
 ```
 
-Do **not** record any checksum that has not been computed from the actual staged
-bytes and reconciled with the upstream source.
+The output must match the `SHA-256` column above byte-for-byte. **No checksum is
+recorded here that was not computed from the actual staged bytes.** A maintainer
+should additionally reconcile each value against the upstream published checksum
+before production cutover.
 
 ---
 
@@ -75,17 +103,23 @@ bytes and reconciled with the upstream source.
 - **Pinned coordinates.** Scala **2.12** — the connector JAR must be the `_2.12`
   build, because AWS Glue 4.0 runs Scala 2.12 (the `_2.13` build is **not**
   used). Runtime target: **AWS Glue 4.0 = Apache Spark 3.3.x, Python 3.10**. All
-  three files are the **released** Delta `3.2.0` line — **not** this repository's
+  four files are the **released** Delta `3.2.0` line — **not** this repository's
   `4.1.0-SNAPSHOT` build.
 - **Consumers.**
   - `infra/s3_objects.tf` — uploads each file from this directory to
-    `ARTIFACT_S3_BUCKET` via `aws_s3_object`.
-  - `infra/glue_jobs.tf` — references the two JARs through `--extra-jars` and the
-    wheel through `--additional-python-modules`, by their `ARTIFACT_S3_BUCKET`
-    S3 URIs.
-- **Scope.** Only the three files above are staged. The transitive
-  `io.delta:delta-storage:3.2.0` JAR is **intentionally out of scope** here and
-  is **not** staged in this directory.
+    `ARTIFACT_S3_BUCKET` via `aws_s3_object` (the three JARs are enumerated by
+    the `local.delta_spark_jar` / `local.delta_storage_jar` /
+    `local.delta_storage_transitive_jar` filename locals; the wheel by
+    `local.delta_wheel`).
+  - `infra/glue_jobs.tf` — references the three JARs through `--extra-jars`
+    (built from `local.extra_jars` in `infra/locals.tf`) and the wheel through
+    `--additional-python-modules`, by their `ARTIFACT_S3_BUCKET` S3 URIs.
+- **Scope.** All four files above are staged. The transitive
+  `io.delta:delta-storage:3.2.0` JAR (`delta-storage-3.2.0.jar`) is **in scope**
+  and staged here precisely because the S3 DynamoDB LogStore JAR references its
+  classes (see the *Runtime class-closure note* at the top); it is wired through
+  `infra/locals.tf` → `infra/s3_objects.tf` → `infra/glue_jobs.tf` exactly like
+  the other two JARs.
 
 ---
 
@@ -113,8 +147,9 @@ bytes and reconciled with the upstream source.
   the connector JAR.
 - **Released bytes, staged verbatim** for Terraform upload — no repackaging or
   recompilation.
-- **No invented data** — checksums are `<sha256>` placeholders to be filled at
-  staging time, and no download URLs are fabricated.
+- **No invented data** — every recorded SHA-256 is computed from the actual
+  staged bytes in this directory (re-verifiable via the `sha256sum` command
+  above), and no download URLs are fabricated.
 - **Minimal Change Mandate honored** — no **pre-existing** delta-io/delta monorepo
   source, build, or metadata file (e.g. anything under `spark*/`, `kernel*/`,
   `storage*/`, `build.sbt`, `setup.py`, `version.sbt`) is modified. Everything this

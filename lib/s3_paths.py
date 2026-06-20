@@ -365,6 +365,93 @@ def build_quarantine_uri(quarantine_root: str, table_name: str, run_date: str = 
     return append_uri_segments(quarantine_root, *segments)
 
 
+def validate_source_uri(
+    source_uri: str, *, approved_root: str = "", context: str = "source S3 path"
+) -> str:
+    """Validate a fully qualified ``s3a``/``s3`` source URI and return it normalized.
+
+    The URI is parsed and validated by :func:`_parse_s3_uri` (the scheme must be
+    ``s3a``/``s3``; the bucket and key reject ``..`` traversal, embedded schemes,
+    backslashes, control characters, and empty / absolute segments). The URI must
+    resolve to a NON-EMPTY key: a bare bucket root is rejected because a source
+    location must point at a prefix, never the entire bucket.
+
+    When ``approved_root`` is non-empty it is itself parsed / validated and the
+    candidate is then *confined* to it -- the candidate's bucket must equal the
+    approved bucket, and the candidate's key must equal the approved key or be a
+    component-aligned descendant of it (``<approved_key>/...``). This is what
+    enforces the "approved source bucket / prefix" rule: an operator-supplied
+    override may narrow the read to a specific sub-prefix (for example a single
+    run-date directory) WITHIN the approved source root, but can never redirect
+    the read to a different bucket or outside the approved prefix (which is also
+    the only location the Glue execution role is granted to read -- see
+    ``infra/iam.tf``).
+
+    :param source_uri: The candidate ``s3a://`` / ``s3://`` source URI.
+    :param approved_root: Optional approved source-root URI to confine the
+        candidate to; ``""`` applies shape / scheme / traversal validation only.
+    :param context: Human-readable role of ``source_uri`` for error messages.
+    :returns: The validated, normalized ``<scheme>://<bucket>/<key>`` URI.
+    :raises S3PathError: If the URI (or the approved root) is malformed, points at
+        a bucket root, or falls outside the approved bucket / prefix.
+    """
+    scheme, bucket, key = _parse_s3_uri(source_uri, context=context)
+    if not key:
+        raise S3PathError(
+            f"{context} must include a key/prefix, not just a bucket root: {source_uri!r}"
+        )
+    if approved_root:
+        _, approved_bucket, approved_key = _parse_s3_uri(
+            approved_root, context="approved source root"
+        )
+        if bucket != approved_bucket:
+            raise S3PathError(
+                f"{context} bucket {bucket!r} is outside the approved source bucket "
+                f"{approved_bucket!r}: {source_uri!r}"
+            )
+        if approved_key and not (key == approved_key or key.startswith(approved_key + "/")):
+            raise S3PathError(
+                f"{context} key {key!r} is outside the approved source prefix "
+                f"{approved_key!r}: {source_uri!r}"
+            )
+    return f"{scheme}://{bucket}/{key}"
+
+
+def resolve_source_uri(configured_default: str, override: str = "") -> str:
+    """Resolve the effective Stage 0 source URI from a configured default + override.
+
+    ``configured_default`` is the trusted, infrastructure-provided source root --
+    the Glue ``--source_s3_path`` default argument, composed by Terraform as
+    ``s3a://<source-bucket>/<pipeline-source-prefix>`` and matching the read scope
+    of the Glue execution role's IAM policy (``infra/iam.tf``). It is ALWAYS
+    validated by :func:`validate_source_uri`.
+
+    ``override`` is an OPTIONAL operator-supplied per-run override, forwarded by
+    the MWAA DAG from ``dag_run.conf['source_s3_path']`` as the
+    ``--source_s3_path_override`` job argument. When it is empty / blank the
+    validated ``configured_default`` is returned unchanged, so a scheduled run
+    with no override reads from the configured prefix (this is precisely why the
+    DAG no longer overrides ``--source_s3_path`` itself with an empty string --
+    that previously clobbered the configured default). When the override is
+    non-empty it is validated AND confined to the configured default's bucket and
+    prefix, so a mistaken or hostile override can never redirect the read outside
+    the approved, IAM-scoped source location.
+
+    :param configured_default: The infrastructure-provided ``s3a``/``s3`` source root.
+    :param override: Optional per-run override URI; ``""`` / whitespace selects the
+        configured default.
+    :returns: The validated, normalized effective source URI to read from.
+    :raises S3PathError: If the configured default is malformed, or a non-empty
+        override is malformed or falls outside the approved bucket / prefix.
+    """
+    approved = validate_source_uri(configured_default, context="configured source S3 path")
+    if override is not None and override.strip():
+        return validate_source_uri(
+            override, approved_root=approved, context="source S3 path override"
+        )
+    return approved
+
+
 __all__ = [
     "S3PathError",
     "validate_bucket_name",
@@ -372,4 +459,6 @@ __all__ = [
     "build_delta_table_uri",
     "append_uri_segments",
     "build_quarantine_uri",
+    "validate_source_uri",
+    "resolve_source_uri",
 ]
