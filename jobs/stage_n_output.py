@@ -54,8 +54,8 @@ Responsibility (in order)
    ``schemas/`` registry).
 #. Write each output through :mod:`lib.delta_io` using the manifest's per-table
    ``write_mode`` (``merge`` or ``overwrite``); a ``merge`` passes the manifest's
-   merge condition after deterministic alias normalization (see
-   :func:`_normalize_merge_condition`).
+   merge condition -- authored in ``lib.delta_io``'s ``t`` (target) / ``s`` (source)
+   alias convention -- straight through to :func:`lib.delta_io.merge_delta`.
 #. Emit the mandated six-field CloudWatch completion event exactly once for the
    whole stage (NOT once per table); per-table row counts ride along as optional
    ``**extra`` fields.
@@ -110,11 +110,12 @@ flow). The following MUST be reconciled before production cutover:
    and ``schemas.get_schema("dim_account_snapshot")`` must resolve and their columns
    must match the manifest -- as authored they do (``schemas.output_tables`` declares
    both), but the illustrative column model must be confirmed against the procedure.
-#. **Merge-condition alias convention.** ``lib.delta_io.merge_delta`` aliases the
-   target as ``t`` and the source as ``s``; the manifest condition is normalized to
-   that convention here via :func:`_normalize_merge_condition` (the checked-in
-   manifest already uses ``t``/``s``, so the normalization is a safe no-op today).
-   Align the convention long-term (manifest and ``lib.delta_io`` agree on one).
+#. **Merge-condition alias convention (RESOLVED).** ``config/pipeline_manifest.yaml``
+   and ``lib.delta_io.merge_delta`` now share a single alias convention -- target ``t``
+   and source ``s`` -- so the manifest's merge condition is passed straight through to
+   ``lib.delta_io`` with no rewrite. The former ``target``/``source`` -> ``t``/``s``
+   compatibility shim has been retired now that the configs have converged on one
+   convention.
 
 Job arguments (injected by ``infra/glue_jobs.tf``)
 --------------------------------------------------
@@ -140,6 +141,7 @@ from lib.delta_io import count_rows, read_delta, write_delta
 from lib.job_args import resolve_options
 from lib.logging_utils import StageTimer, emit_completion_event, get_logger
 from lib.manifest import Manifest, load_manifest
+from lib.s3_paths import build_delta_table_uri
 from lib.spark_session import build_spark_session
 from schemas import get_schema
 
@@ -235,40 +237,35 @@ def _resolve_table(manifest: Manifest, name: str) -> dict:
 
 
 def _delta_path(delta_bucket: str, defaults: dict, table: dict) -> str:
-    """Compose the fully qualified ``s3a://`` Delta table location.
+    """Compose the fully qualified, validated ``s3a://`` Delta table location.
 
-    Builds ``s3a://<bucket>/<delta_path_prefix>/<table-path>`` by trimming
-    surrounding whitespace and slashes from the bucket and from each relative
-    segment, dropping any empty segment, and joining the survivors with a single
-    ``/``. ``delta_bucket`` is the scheme-less ``DELTA_S3_BUCKET`` job arg; the
-    ``defaults['delta_path_prefix']`` and per-table ``path`` are relative,
-    env-agnostic manifest values, so the same composition is portable across
-    dev / nonprod / prod and resolves to the exact on-S3 layout the upstream
-    stages wrote (this stage reads what the transform stages produced, so the
-    composed location MUST match theirs).
-
-    Cross-folder reconciliation item: the transform stages
-    (``jobs/stage_1_*.py`` .. ``jobs/stage_3_*.py``) route this same composition
-    through ``lib.s3_paths.build_delta_table_uri``, which additionally performs
-    CWE-22 (path-traversal) hardening on every segment. ``lib.s3_paths`` is not
-    part of this output stage's declared dependency set, so the composition is
-    performed inline here; for the trusted, version-controlled manifest values and
-    the infra-injected bucket argument this job consumes, the result is
-    byte-identical to that helper's output. Aligning every stage on one shared
-    path builder is a pre-production-cutover reconciliation item.
+    Delegates to :func:`lib.s3_paths.build_delta_table_uri`, which composes
+    ``s3a://{delta_bucket}/{defaults['delta_path_prefix']}/{table['path']}`` and
+    centrally validates every piece: the bucket is checked against S3 naming
+    rules (rejecting embedded schemes, slashes, backslashes, ``..`` and control
+    characters), and the prefix / per-table path segments reject traversal
+    tokens, embedded schemes, backslashes, control characters and empty /
+    absolute segments (CWE-22 hardening). This is the SAME shared, validated
+    builder the transform stages (``jobs/stage_1_*.py`` .. ``jobs/stage_3_*.py``)
+    route through, so the output stage composes Delta locations identically to the
+    stages that wrote them -- this stage reads what the transform stages produced,
+    so the composed location MUST match theirs. For legitimate manifest values the
+    output is byte-identical to a plain slash-stripping composition, so the on-S3
+    layout is unchanged. ``delta_bucket`` is the scheme-less ``DELTA_S3_BUCKET`` job
+    arg; the prefix and per-table ``path`` are relative, env-agnostic manifest
+    values, keeping this composition portable across dev / nonprod / prod.
 
     :param delta_bucket: Destination bucket name, without an ``s3a://`` scheme.
     :param defaults: The manifest ``defaults`` mapping (uses ``delta_path_prefix``).
     :param table: The resolved table mapping (uses its relative ``path``).
-    :returns: The fully qualified ``s3a://`` location of the Delta table.
+    :returns: The fully qualified, validated ``s3a://`` location of the Delta table.
+    :raises lib.s3_paths.S3PathError: If the bucket or any path segment is unsafe.
     """
-    bucket = str(delta_bucket).strip().strip("/")
-    segments = (
-        str(defaults.get("delta_path_prefix", "")).strip().strip("/"),
-        str(table.get("path", "")).strip().strip("/"),
+    return build_delta_table_uri(
+        delta_bucket,
+        str(defaults.get("delta_path_prefix", "")),
+        str(table.get("path", "")),
     )
-    key = "/".join(segment for segment in segments if segment)
-    return f"s3a://{bucket}/{key}"
 
 
 def _conform_to_schema(df: DataFrame, schema: StructType) -> DataFrame:
@@ -299,27 +296,6 @@ def _conform_to_schema(df: DataFrame, schema: StructType) -> DataFrame:
         for field in schema.fields
     ]
     return df.select(*projected)
-
-
-def _normalize_merge_condition(cond: str) -> str:
-    """Normalize a manifest merge condition to ``lib.delta_io``'s ``t``/``s`` aliases.
-
-    ``lib.delta_io.merge_delta`` aliases the merge target as ``t`` and the source as
-    ``s`` (``.alias("t")`` / ``.alias("s")``). A manifest may, by convention, write
-    the condition with ``target.`` / ``source.`` alias prefixes; this helper rewrites
-    those prefixes to ``t.`` / ``s.`` deterministically so the predicate matches the
-    aliases ``lib.delta_io`` actually uses. The checked-in manifest already uses
-    ``t``/``s``, so this is a safe no-op there; the rewrite keeps the job correct
-    regardless of which convention a future manifest adopts.
-
-    Cross-folder reconciliation item: long-term, align on a single alias convention
-    across ``config/pipeline_manifest.yaml`` and ``lib.delta_io.merge_delta`` so this
-    normalization can be retired.
-
-    :param cond: The raw merge predicate from the manifest ``merge.condition``.
-    :returns: The predicate with ``target.`` -> ``t.`` and ``source.`` -> ``s.``.
-    """
-    return cond.replace("target.", "t.").replace("source.", "s.")
 
 
 def _with_lineage(df: DataFrame, load_run_id: str) -> DataFrame:
@@ -597,7 +573,9 @@ def main() -> None:
                             f"output table {out_name!r} uses write_mode 'merge' but the "
                             f"manifest declares no 'merge.condition'"
                         )
-                    merge_condition = _normalize_merge_condition(raw_condition)
+                    # Manifest merge conditions are authored in lib.delta_io's t/s
+                    # alias convention, so the predicate passes straight through.
+                    merge_condition = raw_condition
                     # ACID upsert via S3DynamoDBLogStore (mergeSchema=false inside
                     # lib.delta_io); stable keys keep it idempotent (Gate 3).
                     write_delta(
