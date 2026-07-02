@@ -44,7 +44,7 @@
 # SINGLE SOURCE OF TRUTH: every object KEY is built from the prefix locals in
 # infra/locals.tf (jar_prefix, wheel_prefix, code_prefix, config_prefix,
 # mwaa_dag_prefix, mwaa_dag_config_prefix) and the staged-binary filename locals
-# (delta_spark_jar, delta_storage_jar, delta_storage_transitive_jar, delta_wheel).
+# (delta_core_jar, delta_storage_jar, delta_storage_transitive_jar, delta_wheel).
 # infra/glue_jobs.tf builds its Glue argument S3 URIs from the SAME locals, so the
 # upload location and the runtime reference can never drift apart.
 #
@@ -133,19 +133,21 @@ data "archive_file" "schemas_zip" {
 # ===========================================================================
 
 # The three staged Delta JARs, loaded by Glue via `--extra-jars`:
-#   - delta-spark_2.12-3.2.0.jar          (Delta Spark connector / DeltaCatalog)
-#   - delta-storage-s3-dynamodb-3.2.0.jar (io.delta.storage.S3DynamoDBLogStore)
-#   - delta-storage-3.2.0.jar             (transitive base: HadoopFileSystemLogStore,
-#                                          CloseableIterator, internal.PathLock,
-#                                          internal.FileNameUtils -- the classes the
-#                                          S3DynamoDBLogStore base extends/uses)
+#   - delta-core_2.12-2.3.0.jar           (Delta Spark connector / DeltaCatalog;
+#                                          Maven io.delta:delta-core_2.12 in the 2.x
+#                                          line, renamed to delta-spark_2.12 in 3.0+)
+#   - delta-storage-s3-dynamodb-2.3.0.jar (io.delta.storage.S3DynamoDBLogStore)
+#   - delta-storage-2.3.0.jar             (transitive base: HadoopFileSystemLogStore,
+#                                          CloseableIterator, internal.FileNameUtils
+#                                          -- the classes the S3DynamoDBLogStore base
+#                                          extends/uses)
 # The third JAR is REQUIRED for runtime class-closure: with --datalake-formats
 # omitted and public Maven prohibited (AAP 0.7.1), the S3 DynamoDB LogStore cannot
 # class-load without its delta-storage base also on the classpath.
 # Keyed under ${jar_prefix}; the exact filenames come from locals so they match
 # the --extra-jars URIs built in infra/glue_jobs.tf.
 resource "aws_s3_object" "jars" {
-  for_each = toset([local.delta_spark_jar, local.delta_storage_jar, local.delta_storage_transitive_jar])
+  for_each = toset([local.delta_core_jar, local.delta_storage_jar, local.delta_storage_transitive_jar])
 
   bucket = var.artifact_s3_bucket
   key    = "${local.jar_prefix}/${each.value}"

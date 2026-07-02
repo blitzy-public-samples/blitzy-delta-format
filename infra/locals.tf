@@ -120,19 +120,27 @@ locals {
   # These MUST match the artifacts/ siblings byte-for-byte: s3_objects.tf uploads
   # files with these names and glue_jobs.tf references the same names in its
   # --extra-jars / --additional-python-modules URIs.
+  #
+  # Delta 2.3.0 line (AWS Glue 4.0 = Apache Spark 3.3.x compatible; AAP §0.3.3
+  # RESOLVED). NOTE: the connector JAR is the Maven artifact io.delta:delta-core_2.12
+  # in the Delta 2.x line — it was renamed to io.delta:delta-spark_2.12 only in
+  # Delta 3.0+. The PyPI package name stays "delta-spark" for both lines (wheel
+  # below), and the mandated Delta class names are unchanged across 2.x/3.x
+  # (io.delta.storage.S3DynamoDBLogStore, io.delta.sql.DeltaSparkSessionExtension,
+  # org.apache.spark.sql.delta.catalog.DeltaCatalog), so no job/lib code changes.
   # -------------------------------------------------------------------------
-  delta_spark_jar   = "delta-spark_2.12-3.2.0.jar"
-  delta_storage_jar = "delta-storage-s3-dynamodb-3.2.0.jar"
+  delta_core_jar    = "delta-core_2.12-2.3.0.jar"
+  delta_storage_jar = "delta-storage-s3-dynamodb-2.3.0.jar"
   # The S3 DynamoDB LogStore JAR above is NOT self-contained: its
   # io.delta.storage.S3DynamoDBLogStore -> BaseExternalLogStore base references
   # io.delta.storage.HadoopFileSystemLogStore, CloseableIterator, and the
-  # io.delta.storage.internal.{PathLock,FileNameUtils} helpers, which live in the
-  # transitive io.delta:delta-storage:3.2.0 artifact. Because --datalake-formats
-  # is deliberately omitted and public Maven is prohibited at runtime (AAP 0.7.1),
+  # io.delta.storage.internal.FileNameUtils helper, which live in the transitive
+  # io.delta:delta-storage:2.3.0 artifact. Because --datalake-formats is
+  # deliberately omitted and public Maven is prohibited at runtime (AAP 0.7.1),
   # that base JAR MUST be staged in ARTIFACT_S3_BUCKET and placed on --extra-jars
   # too, or the LogStore fails to class-load at job start.
-  delta_storage_transitive_jar = "delta-storage-3.2.0.jar"
-  delta_wheel                  = "delta_spark-3.2.0-py3-none-any.whl"
+  delta_storage_transitive_jar = "delta-storage-2.3.0.jar"
+  delta_wheel                  = "delta_spark-2.3.0-py3-none-any.whl"
 
   # -------------------------------------------------------------------------
   # (f) S3 URIs for Glue job arguments (consumed by glue_jobs.tf
@@ -140,12 +148,12 @@ locals {
   # -------------------------------------------------------------------------
 
   # --extra-jars: the three Delta JARs, comma-separated, from ARTIFACT_S3_BUCKET.
-  # delta-spark provides the DeltaCatalog / SQL connector; delta-storage-s3-dynamodb
+  # delta-core provides the DeltaCatalog / SQL connector; delta-storage-s3-dynamodb
   # provides S3DynamoDBLogStore; and delta-storage (the transitive base) provides
-  # HadoopFileSystemLogStore + the internal PathLock/FileNameUtils/CloseableIterator
+  # HadoopFileSystemLogStore + the internal FileNameUtils / CloseableIterator
   # classes the LogStore extends/uses. All three are required on the classpath.
   extra_jars = join(",", [
-    "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_spark_jar}",
+    "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_core_jar}",
     "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_storage_jar}",
     "s3://${var.artifact_s3_bucket}/${local.jar_prefix}/${local.delta_storage_transitive_jar}",
   ])

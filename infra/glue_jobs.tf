@@ -78,7 +78,7 @@ locals {
   # (a) Arguments applied to EVERY stage.
   #
   # The Delta artifact references below are the ONLY runtime resolution path for
-  # the pinned Delta 3.2.0 wheel + JARs (public PyPI/Maven are prohibited,
+  # the pinned Delta 2.3.0 wheel + JARs (public PyPI/Maven are prohibited,
   # AAP 0.1.2); all four point at objects uploaded to ARTIFACT_S3_BUCKET by
   # infra/s3_objects.tf using the very same infra/locals.tf values.
   #
@@ -219,7 +219,7 @@ resource "aws_glue_job" "stage" {
 
   # NOTE (AAP 0.1.2): we deliberately do NOT set --datalake-formats=delta. That
   # Glue magic argument would load Glue's OWN bundled Delta version, defeating
-  # the requirement to run the pinned Delta 3.2.0 wheel + JARs staged in
+  # the requirement to run the pinned Delta 2.3.0 wheel + JARs staged in
   # ARTIFACT_S3_BUCKET. Delta is provided solely through --extra-jars /
   # --additional-python-modules above.
   #

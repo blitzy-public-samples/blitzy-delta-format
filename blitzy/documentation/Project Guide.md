@@ -13,21 +13,21 @@ This project delivers a net-new, configuration-driven, multi-stage **AWS Glue 4.
 
 ### 1.2 Completion Status
 
-The completion percentage is computed using the AAP-scoped hours methodology: `Completed ÷ (Completed + Remaining)`. The entire autonomous code build is complete and internally validated; the remaining work is path-to-production (live AWS deployment, gate execution against real data, and resolution of four documented open items).
+The completion percentage is computed using the AAP-scoped hours methodology: `Completed ÷ (Completed + Remaining)`. The entire autonomous code build is complete and internally validated; the remaining work is path-to-production (live AWS deployment, gate execution against real data, and resolution of three documented open items).
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'pie1':'#5B39F3','pie2':'#FFFFFF','pieStrokeColor':'#B23AF2','pieOuterStrokeColor':'#B23AF2','pieSectionTextColor':'#B23AF2','pieTitleTextSize':'18px','pieLegendTextColor':'#B23AF2'}}}%%
-pie showData title sp_chain_replacement — 83.3% Complete (AAP-scoped)
-    "Completed Work (AI)" : 300
-    "Remaining Work" : 60
+pie showData title sp_chain_replacement — 85.6% Complete (AAP-scoped)
+    "Completed Work (AI)" : 308
+    "Remaining Work" : 52
 ```
 
 | Metric | Value |
 |---|---|
 | **Total Hours** | **360 h** |
-| **Completed Hours (AI + Manual)** | **300 h** (AI: 300 h · Manual: 0 h) |
-| **Remaining Hours** | **60 h** |
-| **Percent Complete** | **83.3 %** |
+| **Completed Hours (AI + Manual)** | **308 h** (AI: 308 h · Manual: 0 h) |
+| **Remaining Hours** | **52 h** |
+| **Percent Complete** | **85.6 %** |
 
 > Color key: **Completed = Dark Blue `#5B39F3`** · **Remaining = White `#FFFFFF`**.
 
@@ -39,13 +39,12 @@ pie showData title sp_chain_replacement — 83.3% Complete (AAP-scoped)
 - ✅ **1:1 stored-procedure mapping** — manifest drives 5 stages (ingest + 3 SP transforms + output) and 6 tables (4 staging `overwrite`, `fact_general_ledger` merge, `dim_account_snapshot` overwrite); 80/80 consistency checks passed.
 - ✅ **Terraform configuration valid** — `terraform fmt -check` and `terraform validate` pass; least-privilege IAM with zero wildcard resources; all five mandatory tags present on taggable resources.
 - ✅ **MWAA DAG verified** — imports cleanly as `sp_chain_replacement` (cron `0 6 * * *`), 5 sequential `GlueJobOperator` tasks named exactly `{env}-{domain}-{pipeline_name}-{step}`.
-- ✅ **Delta 3.2.0 artifacts staged** (2 connector JARs + transitive storage JAR + Python wheel) with byte-for-byte checksum verification for Terraform-driven upload.
+- ✅ **Delta 2.3.0 artifacts staged** (the `delta-core_2.12` connector JAR + the `delta-storage-s3-dynamodb` LogStore JAR + the transitive `delta-storage` base JAR + Python wheel) with byte-for-byte SHA-256 checksums and Maven `.sha1` reconciliation for Terraform-driven upload.
 
 ### 1.4 Critical Unresolved Issues
 
 | Issue | Impact | Owner | ETA |
 |---|---|---|---|
-| Delta 3.2.0 ↔ Glue 4.0 Spark-version tension (3.5.x vs 3.3.x) | May require a `(pyspark, delta-spark)` version adjustment before prod cutover | Platform / Data Eng | Before prod cutover |
 | Gate 1 parity unverified against legacy baseline | 1:1 SP-translation errors would surface only here; blocks production acceptance | Data Eng | After dev deploy + baseline load |
 | Legacy SQL Server parity baseline extract not yet available | Hard prerequisite — blocks Gate 1 | Client / Data team | Before Gate 1 |
 | No live AWS deployment performed | Glue/DynamoDB/MWAA/CloudWatch integration untested end-to-end | DevOps / Platform | Sprint 1 of handoff |
@@ -62,11 +61,12 @@ pie showData title sp_chain_replacement — 83.3% Complete (AAP-scoped)
 
 ### 1.6 Recommended Next Steps
 
-1. **[High]** Resolve the Delta 3.2.0 ↔ Glue 4.0 Spark-version compatibility item — confirm a working `(pyspark, delta-spark)` pair on Glue 4.0 or escalate a version adjustment.
-2. **[High]** Provision AWS prerequisites (credentials, Terraform state backend) and run `terraform apply` to the **dev** environment.
-3. **[High]** Acquire and load the legacy parity baseline, then execute **Gate 1** (`pytest validate/test_parity.py --env dev`) and reconcile any mismatches.
-4. **[Medium]** Promote to **nonprod/prod**, deploy the DAG to MWAA, run end-to-end, and close **Gates 2–5** against the live environment.
-5. **[Low]** Obtain the Informatica SLA, benchmark wall-clock to close **Gate 6**, and confirm the MWAA-naming and secrets-management open questions.
+> The Delta ↔ Glue Spark-version compatibility item (formerly AAP §0.3.3) is **resolved**: Glue 4.0 (Spark 3.3.x) pairs with `delta-spark 2.3.0` (connector Maven `io.delta:delta-core_2.12:2.3.0`), verified via the official Delta compatibility matrix, the `delta-spark==2.3.0` wheel metadata (`Requires-Dist: pyspark (<3.4.0,>=3.3.0)`), and an 11/11 local Spark 3.3.4 smoke test.
+
+1. **[High]** Provision AWS prerequisites (credentials, Terraform state backend) and run `terraform apply` to the **dev** environment.
+2. **[High]** Acquire and load the legacy parity baseline, then execute **Gate 1** (`pytest validate/test_parity.py --env dev`) and reconcile any mismatches.
+3. **[Medium]** Promote to **nonprod/prod**, deploy the DAG to MWAA, run end-to-end, and close **Gates 2–5** against the live environment.
+4. **[Low]** Obtain the Informatica SLA, benchmark wall-clock to close **Gate 6**, and confirm the MWAA-naming and secrets-management open questions.
 
 ---
 
@@ -85,10 +85,11 @@ All completed work was performed autonomously by Blitzy agents (0 human/manual h
 | MWAA orchestration DAG (`dags/`) | 10 | One DAG, 5 sequential `GlueJobOperator` tasks — 288 LOC |
 | Terraform infrastructure (`infra/`) | 42 | Glue/IAM/DynamoDB/S3 objects/providers/variables/locals/outputs/versions + tfvars + backend — 1,991 LOC |
 | Parity & security harness (`validate/`) | 30 | Gate 1 parity + Gate 5 security tests, reconciliation, conftest/fixtures — 1,552 LOC |
-| Staged Delta artifacts (`artifacts/`) | 6 | Real binaries (2 connector JARs + storage JAR + wheel) + provenance/checksum README |
+| Staged Delta artifacts (`artifacts/`) | 6 | Real Delta 2.3.0 binaries (`delta-core_2.12` connector JAR + `delta-storage-s3-dynamodb` LogStore JAR + transitive `delta-storage` JAR + wheel) + provenance/checksum README |
 | Integration & multi-checkpoint review/QA remediation | 24 | CP1/CP2/final-checkpoint findings, QA INC-2 (signed_amount), QA FINAL_ALT (Stage 3 regrain), dep-pin & JAR-count reconciliation |
 | Blitzy autonomous validation | 10 | Live Spark+Delta smoke (11/11), 80 consistency checks, compile/import/lint/terraform validate |
-| **Total Completed** | **300** | |
+| Delta ↔ Glue Spark-version compatibility resolution (Refine PR) | 8 | Verified `delta-spark 2.3.0` ↔ Spark 3.3.x via docs.delta.io matrix + wheel metadata; restaged real 2.3.0 binaries; rebuilt `.venv` (pyspark 3.3.4); 11/11 smoke re-passed |
+| **Total Completed** | **308** | |
 
 ### 2.2 Remaining Work Detail
 
@@ -96,7 +97,6 @@ All remaining work is path-to-production; none represents an in-scope code defec
 
 | Category | Hours | Priority |
 |---|---:|---|
-| Delta 3.2.0 ↔ Glue 4.0 Spark-version compatibility resolution | 8 | High |
 | AWS account prep, credentials & Terraform state backend provisioning | 4 | High |
 | Terraform apply to DEV environment | 4 | High |
 | Legacy SQL Server parity baseline extract acquisition & load | 6 | High |
@@ -108,18 +108,18 @@ All remaining work is path-to-production; none represents an in-scope code defec
 | Gate 5 live IAM `simulate-principal-policy` execution | 2 | Medium |
 | Gate 6 performance benchmark + obtain Informatica SLA | 6 | Low |
 | Confirm open questions (MWAA naming, secrets management) | 2 | Low |
-| **Total Remaining** | **60** | |
+| **Total Remaining** | **52** | |
 
-> **Priority subtotals:** High = 32 h · Medium = 20 h · Low = 8 h → **60 h**.
+> **Priority subtotals:** High = 24 h · Medium = 20 h · Low = 8 h → **52 h**.
 
 ### 2.3 Hours Reconciliation
 
 | Reconciliation Check | Value |
 |---|---|
-| Section 2.1 Completed | 300 h |
-| Section 2.2 Remaining | 60 h |
+| Section 2.1 Completed | 308 h |
+| Section 2.2 Remaining | 52 h |
 | **2.1 + 2.2 = Total (Section 1.2)** | **360 h** ✓ |
-| Completion = 300 ÷ 360 | **83.3 %** ✓ |
+| Completion = 308 ÷ 360 | **85.6 %** ✓ |
 
 ---
 
@@ -131,7 +131,7 @@ All entries below originate from Blitzy's autonomous validation logs for this pr
 |---|---|---:|---:|---:|---:|---|
 | Parity acceptance (Gate 1) | pytest | 6 | 0 | 0 | N/A | **6 skipped by design** — AWS-integration tests require a deployed env |
 | Security acceptance (Gate 5) | pytest | 2 | 0 | 0 | N/A | **2 skipped by design** — require live IAM/deployed policy |
-| Runtime smoke (Spark + Delta) | pyspark 3.5.8 + delta-spark 3.2.0 | 11 | 11 | 0 | N/A | Session/props/StructType/overwrite/merge/idempotency/bad-record fail-fast |
+| Runtime smoke (Spark + Delta) | pyspark 3.3.4 + delta-spark 2.3.0 | 11 | 11 | 0 | N/A | Session/props/StructType/overwrite/merge/idempotency/bad-record fail-fast |
 | Config consistency | custom harness | 80 | 80 | 0 | N/A | manifest ↔ schemas ↔ jobs ↔ write-modes ↔ parity blocks |
 | Compilation | `compileall` (`-W error::SyntaxWarning`) | 23 | 23 | 0 | N/A | All in-scope `.py` files |
 | Module import | python import | 18 | 18 | 0 | N/A | `lib.*`, `schemas.*`, `validate.*`, `jobs.*` |
@@ -190,7 +190,7 @@ Cross-mapping of AAP mandates and validation gates to status. "Static PASS" = ve
 | Performance (Gate 6) | ≤ 2× Informatica SLA | ⏳ Pending | Non-blocking until prod; needs SLA value |
 | Infrastructure validity | `terraform validate` | ✅ Pass | "Success! The configuration is valid." |
 
-**Fixes applied during autonomous validation:** CHECKPOINT 1 schema/manifest reconciliation; CP2 SP-replacement parity & S3 path-safety findings; QA INC-2 (`signed_amount` reconciliation note); final-checkpoint review findings; QA FINAL_ALT (Stage 3 regrain to account × date); dependency-pin relaxation to lower-bound floors per AAP §0.3.1; staged-JAR count reconciliation (2 → 3, adding the transitive `delta-storage-3.2.0.jar`).
+**Fixes applied during autonomous validation:** CHECKPOINT 1 schema/manifest reconciliation; CP2 SP-replacement parity & S3 path-safety findings; QA INC-2 (`signed_amount` reconciliation note); final-checkpoint review findings; QA FINAL_ALT (Stage 3 regrain to account × date); dependency-pin relaxation to lower-bound floors per AAP §0.3.1; staged-JAR count reconciliation (2 → 3, adding the transitive `delta-storage-2.3.0.jar`).
 
 **Outstanding (path-to-production):** Gate 1 parity, Gate 2 ACID metric, Gate 3 full idempotency, Gate 5 live security, Gate 6 performance — all require a deployed environment and/or client inputs.
 
@@ -200,7 +200,7 @@ Cross-mapping of AAP mandates and validation gates to status. "Static PASS" = ve
 
 | # | Risk | Category | Severity | Probability | Mitigation | Status |
 |---|---|---|---|---|---|---|
-| T1 | Delta 3.2.0 vs Glue 4.0 Spark mismatch (3.5.x vs 3.3.x) | Technical | High | Medium | Confirm a working pair on Glue 4.0 or escalate version adjustment; documented as AAP open item | Open (documented) |
+| T1 | Delta ↔ Glue Spark-version pairing (Glue 4.0 ships Spark 3.3.x) | Technical | High | — | **Resolved:** selected `delta-spark 2.3.0` (connector `io.delta:delta-core_2.12:2.3.0`) for Spark 3.3.x — verified via docs.delta.io matrix + `delta-spark==2.3.0` wheel metadata (`pyspark <3.4,>=3.3`) + 11/11 local Spark 3.3.4 smoke; artifacts/config/docs restaged to 2.3.0 (AAP §0.3.3 closed) | Resolved |
 | T2 | 1:1 SP→PySpark parity logic unverified vs real data | Technical | High | Medium | Run Gate 1 with legacy baseline; investigate mismatches | Open |
 | T3 | Delta read-time nullable relaxation vs strict schema equality | Technical | Low | Low | Expected Parquet behavior; reconciliation accounts for it | Mitigated |
 | T4 | Stage 3 account×date regrain (recent QA fix) grain subtlety | Technical | Medium | Low | Documented in manifest; verify at Gate 1 | Mitigated / verify |
@@ -216,7 +216,7 @@ Cross-mapping of AAP mandates and validation gates to status. "Static PASS" = ve
 | I3 | DynamoDB conditional-write coordination bypassed locally | Integration | Medium | Low | Verify via Gate 2 on deployed env | Open |
 | I4 | Pre-provisioned prereqs (MWAA env, buckets) assumed | Integration | Medium | Low | Confirm exist + named per tfvars before apply | Open |
 
-**Risk summary:** 4 High-severity risks dominate the critical path — the Spark-version tension (T1), parity-logic verification (T2), live-AWS integration (I1), and baseline availability (I2). All are path-to-production, not code defects.
+**Risk summary:** Of the four originally High-severity risks, the Spark-version tension (T1) is now **resolved** (Delta 2.3.0 on Glue 4.0 Spark 3.3.x). Three High-severity risks remain on the critical path — parity-logic verification (T2), live-AWS integration (I1), and baseline availability (I2). All remaining items are path-to-production, not code defects.
 
 ---
 
@@ -227,16 +227,16 @@ Cross-mapping of AAP mandates and validation gates to status. "Static PASS" = ve
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'pie1':'#5B39F3','pie2':'#FFFFFF','pieStrokeColor':'#B23AF2','pieOuterStrokeColor':'#B23AF2','pieSectionTextColor':'#B23AF2','pieTitleTextSize':'18px','pieLegendTextColor':'#B23AF2'}}}%%
 pie showData title Project Hours (Total 360h)
-    "Completed Work" : 300
-    "Remaining Work" : 60
+    "Completed Work" : 308
+    "Remaining Work" : 52
 ```
 
-**Remaining work by priority** (sums to the 60 h Remaining in Sections 1.2 and 2.2):
+**Remaining work by priority** (sums to the 52 h Remaining in Sections 1.2 and 2.2):
 
 ```mermaid
 %%{init: {'theme':'base', 'themeVariables': {'pie1':'#5B39F3','pie2':'#B23AF2','pie3':'#A8FDD9','pieStrokeColor':'#B23AF2','pieSectionTextColor':'#1A1A1A','pieTitleTextSize':'16px'}}}%%
-pie showData title Remaining 60h by Priority
-    "High" : 32
+pie showData title Remaining 52h by Priority
+    "High" : 24
     "Medium" : 20
     "Low" : 8
 ```
@@ -246,7 +246,6 @@ pie showData title Remaining 60h by Priority
 | Category | Hours | Bar |
 |---|---:|---|
 | Gate 1 parity execution & investigation | 10 | ██████████ |
-| Delta ↔ Glue compatibility resolution | 8 | ████████ |
 | Parity baseline acquisition & load | 6 | ██████ |
 | Terraform apply nonprod + prod + Gate 4 | 6 | ██████ |
 | MWAA DAG deploy + end-to-end run | 6 | ██████ |
@@ -257,29 +256,29 @@ pie showData title Remaining 60h by Priority
 | Gate 3 idempotency on deployed env | 3 | ███ |
 | Gate 5 live IAM simulate-principal-policy | 2 | ██ |
 | Open questions (MWAA naming, secrets) | 2 | ██ |
-| **Total** | **60** | |
+| **Total** | **52** | |
 
 ---
 
 ## 8. Summary & Recommendations
 
-**Achievements.** The `sp_chain_replacement` pipeline is **83.3% complete** on an AAP-scoped basis (300 of 360 hours). Every AAP §0.5.1 deliverable — 46 files spanning Glue jobs, the shared ACID library, explicit schemas, the MWAA DAG, the config manifest, Terraform IaC, the parity/security harness, and staged Delta artifacts — is implemented, compiles, imports, and passes a live local Spark + Delta smoke test (11/11) and 80/80 config-consistency checks. The Minimal Change Mandate is fully respected (0 existing files touched), and the code already passed several internal review/QA checkpoints.
+**Achievements.** The `sp_chain_replacement` pipeline is **85.6% complete** on an AAP-scoped basis (308 of 360 hours). Every AAP §0.5.1 deliverable — 46 files spanning Glue jobs, the shared ACID library, explicit schemas, the MWAA DAG, the config manifest, Terraform IaC, the parity/security harness, and staged Delta artifacts — is implemented, compiles, imports, and passes a live local Spark + Delta smoke test (11/11) and 80/80 config-consistency checks. The Minimal Change Mandate is fully respected (0 existing files touched), and the code already passed several internal review/QA checkpoints.
 
-**Remaining gaps (the 60 hours).** What remains is entirely **path-to-production**: there has been no live AWS deployment, so the acceptance gates that depend on a deployed environment and real data (Gate 1 parity, Gate 2 ACID metrics, Gate 3 full idempotency, Gate 5 live IAM simulation, Gate 6 performance) are not yet closed, and four open items remain — most importantly the **Delta 3.2.0 ↔ Glue 4.0 Spark-version tension**.
+**Remaining gaps (the 52 hours).** What remains is entirely **path-to-production**: there has been no live AWS deployment, so the acceptance gates that depend on a deployed environment and real data (Gate 1 parity, Gate 2 ACID metrics, Gate 3 full idempotency, Gate 5 live IAM simulation, Gate 6 performance) are not yet closed, and three open items remain (MWAA task-naming confirmation, secrets-management approach, and the Informatica SLA for Gate 6). The **Delta ↔ Glue Spark-version compatibility item is resolved** (Delta 2.3.0 on Glue 4.0 Spark 3.3.x).
 
-**Critical path to production.** (1) Resolve the Spark-version compatibility item; (2) provision AWS prerequisites and `terraform apply` to dev; (3) load the legacy baseline and pass Gate 1 parity; (4) promote to nonprod/prod, deploy the DAG, and close Gates 2–5; (5) obtain the Informatica SLA and close Gate 6.
+**Critical path to production.** With the Spark-version compatibility item resolved (Delta 2.3.0 on Glue 4.0 Spark 3.3.x): (1) provision AWS prerequisites and `terraform apply` to dev; (2) load the legacy baseline and pass Gate 1 parity; (3) promote to nonprod/prod, deploy the DAG, and close Gates 2–5; (4) obtain the Informatica SLA and close Gate 6.
 
 **Success metrics.** Production readiness is achieved when all six gates pass in the target environment with parity ≥ 99.99% for 100% of tables and `terraform plan` reports zero drift.
 
-**Production readiness assessment.** **Not production-ready yet**, but the code base is in a strong, validated state. With a live AWS account, the parity baseline, and the SLA, the estimated **60 hours** of remaining effort is well-scoped and low-ambiguity, with the version-compatibility item carrying the most upside risk.
+**Production readiness assessment.** **Not production-ready yet**, but the code base is in a strong, validated state. With a live AWS account, the parity baseline, and the SLA, the estimated **52 hours** of remaining effort is well-scoped and low-ambiguity; the Delta ↔ Glue version-compatibility item that previously carried the most upside risk is now resolved (Delta 2.3.0 on Spark 3.3.x).
 
 | Metric | Value |
 |---|---|
-| AAP-scoped completion | 83.3% |
+| AAP-scoped completion | 85.6% |
 | Code defects found (in scope) | 0 |
 | Gates passing (static/local) | 4 of 6 (G2, G3 structural, G4, G5 static) |
 | Gates pending live deploy | G1, G6 (+ live confirmation of G2/G3/G5) |
-| Estimated remaining effort | 60 h |
+| Estimated remaining effort | 52 h |
 
 ---
 
@@ -309,7 +308,7 @@ To recreate the test virtualenv from scratch:
 ```bash
 python3.10 -m venv .venv
 source .venv/bin/activate
-# delta-spark==3.2.0 resolves from the local artifacts/ wheel (no public PyPI required at runtime)
+# delta-spark==2.3.0 resolves from the local artifacts/ wheel (no public PyPI required at runtime)
 pip install -r validate/requirements.txt
 ```
 
@@ -318,9 +317,10 @@ pip install -r validate/requirements.txt
 Dependencies are **not** resolved from public repositories at runtime. Terraform uploads the staged binaries to `ARTIFACT_S3_BUCKET`, and each Glue job references them:
 
 ```text
---extra-jars               s3://<ARTIFACT_S3_BUCKET>/.../delta-spark_2.12-3.2.0.jar,
-                           s3://<ARTIFACT_S3_BUCKET>/.../delta-storage-s3-dynamodb-3.2.0.jar
---additional-python-modules  delta-spark==3.2.0   (wheel resolved from ARTIFACT_S3_BUCKET)
+--extra-jars               s3://<ARTIFACT_S3_BUCKET>/.../delta-core_2.12-2.3.0.jar,
+                           s3://<ARTIFACT_S3_BUCKET>/.../delta-storage-s3-dynamodb-2.3.0.jar,
+                           s3://<ARTIFACT_S3_BUCKET>/.../delta-storage-2.3.0.jar
+--additional-python-modules  delta-spark==2.3.0   (wheel resolved from ARTIFACT_S3_BUCKET)
 ```
 
 ### 9.4 Local Verification (all commands tested — exit 0)
@@ -369,7 +369,7 @@ Required environment variables for the gates: `AWS_REGION`, `DELTA_S3_BUCKET`, `
 
 - **`8 skipped` in pytest** — expected locally; the parity/security tests are AWS-integration tests that gracefully skip when the deployment env vars are absent.
 - **`terraform init` backend error** — the S3 state bucket referenced in `envs/<env>-backend.hcl` must pre-exist.
-- **Spark/Delta version errors on Glue** — see the Delta 3.2.0 ↔ Glue 4.0 (Spark 3.3.x) open item (AAP §0.3.3); confirm the compatible `(pyspark, delta-spark)` pair before prod.
+- **Spark/Delta version errors on Glue** — the Glue 4.0 (Spark 3.3.x) compatible pairing is `delta-spark 2.3.0` + `pyspark 3.3.x` (connector Maven `io.delta:delta-core_2.12:2.3.0`); this is **resolved** (AAP §0.3.3). If such errors appear, confirm the staged artifacts are the 2.3.0 set (not 3.2.0).
 - **DAG import errors** — ensure `PIPELINE_ENV` and `PIPELINE_MANIFEST_PATH` are set and `PYTHONPATH` includes the repo root.
 
 ---
@@ -408,20 +408,20 @@ Required environment variables for the gates: `AWS_REGION`, `DELTA_S3_BUCKET`, `
 | `dags/sp_chain_replacement_dag.py` | MWAA DAG (5 sequential `GlueJobOperator` tasks) |
 | `infra/*.tf` + `infra/envs/*` | Terraform config, per-env tfvars, backend HCL |
 | `validate/test_parity.py` | Gate 1 (parity) + Gate 5 (security) acceptance tests |
-| `artifacts/` | Staged Delta 3.2.0 JARs + wheel + provenance README |
+| `artifacts/` | Staged Delta 2.3.0 JARs + wheel + provenance README |
 
 ### Appendix D — Technology Versions
 
 | Component | Version | Source |
 |---|---|---|
 | AWS Glue | 4.0 (Spark 3.3.x, Python 3.10, Scala 2.12) | Authoritative (AAP) |
-| `delta-spark` | 3.2.0 | Authoritative (AAP); staged wheel |
-| `io.delta:delta-spark_2.12` | 3.2.0 | Staged JAR |
-| `io.delta:delta-storage-s3-dynamodb` | 3.2.0 | Staged JAR (+ transitive `delta-storage-3.2.0.jar`) |
+| `delta-spark` | 2.3.0 | Verified compatible with Glue 4.0 Spark 3.3.x (AAP §0.3.3 resolved); staged wheel |
+| `io.delta:delta-core_2.12` | 2.3.0 | Staged connector JAR (Delta 2.x Maven artifact; renamed to `delta-spark_2.12` in Delta 3.0+) |
+| `io.delta:delta-storage-s3-dynamodb` | 2.3.0 | Staged JAR (+ transitive `delta-storage-2.3.0.jar`) |
 | Terraform | 1.15.6 | Local validation |
 | `hashicorp/aws` provider | 5.100.0 (`~> 5.0`) | `.terraform.lock.hcl` |
 | `hashicorp/archive` provider | 2.8.0 | `.terraform.lock.hcl` |
-| pyspark (local test) | 3.5.8 | `.venv` (see compatibility open item) |
+| pyspark (local test) | 3.3.4 | `.venv` (Spark 3.3.x line; matches Glue 4.0 runtime) |
 | apache-airflow (local DAG check) | 2.11.2 + providers-amazon 9.22.0 | `.venv-airflow` |
 | Java | 17 (OpenJDK) | Local validation |
 
@@ -447,7 +447,7 @@ Required environment variables for the gates: `AWS_REGION`, `DELTA_S3_BUCKET`, `
 
 | Tool | Role |
 |---|---|
-| `.venv` (Python 3.10.20) | Runs jobs/lib/schemas/validate; pyspark 3.5.8 + delta-spark 3.2.0 + boto3 + pytest + pyyaml |
+| `.venv` (Python 3.10.20) | Runs jobs/lib/schemas/validate; pyspark 3.3.4 + delta-spark 2.3.0 + boto3 + pytest + pyyaml |
 | `.venv-airflow` (Python 3.10.20) | DAG import-check only; apache-airflow 2.11.2 + providers-amazon 9.22.0 |
 | Terraform CLI 1.15.6 | IaC validate/plan/apply |
 | `javap` | Verifies JAR class closure (`S3DynamoDBLogStore` + transitive storage JAR) |
