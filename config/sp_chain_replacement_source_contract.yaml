@@ -1,0 +1,80 @@
+#
+# Copyright (2024) The Delta Lake Project Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ---------------------------------------------------------------------------
+# Source contract for the `sp_chain_replacement` finance pipeline (Stage 0).
+#
+# Purpose
+#   Declares exactly how `jobs/stage_0_ingest.py` must parse the delimited flat
+#   files it reads from PIPELINE_SOURCE_S3_PREFIX before writing the
+#   `staging_raw` Delta table. This is the per-pipeline *child* contract; it is
+#   referenced from the authoritative parent map `config/pipeline_manifest.yaml`
+#   via that file's `source_contract` field, and it is loaded + validated by
+#   `lib/source_contract.py` (PyYAML `safe_load`) into a typed object.
+#
+# Names + order ONLY (NOT types)
+#   `expected_columns` declares the physical column NAMES and ORDER of the
+#   incoming flat file ONLY. It deliberately carries NO data types. The
+#   authoritative data types live in `schemas/staging_raw.py` as the explicit
+#   PySpark `StructType` STAGING_RAW (read/written with `mergeSchema=false`,
+#   schema inference disabled). Keep this ordered list field-for-field identical
+#   to STAGING_RAW; the column model here is canonical for Stage 0.
+#
+# No secrets / no environment-specific values
+#   This file describes FILE FORMAT and COLUMN LAYOUT only. It MUST NOT contain
+#   bucket names, regions, credentials, or absolute S3 URIs. The actual source
+#   location is injected at runtime via Glue job arguments
+#   (PIPELINE_SOURCE_S3_PREFIX); the quarantine bucket/prefix is composed from
+#   the manifest defaults at runtime.
+# ---------------------------------------------------------------------------
+
+pipeline: sp_chain_replacement
+target_table: staging_raw
+
+source:
+  format: delimited                       # delimited (CSV-family) flat file
+  delimiter: "|"                          # field delimiter
+  quote: "\""                             # quote character -> "
+  escape: "\\"                            # escape character -> \
+  null_value: "\\N"                       # null string sentinel -> \N
+  header: true                            # header presence flag
+  encoding: "UTF-8"                       # file encoding
+  multiline: false                        # quoted fields do not span newlines
+  ignore_leading_white_space: false       # preserve leading whitespace in fields
+  ignore_trailing_white_space: false      # preserve trailing whitespace in fields
+  date_format: "yyyy-MM-dd"               # date parse pattern
+  timestamp_format: "yyyy-MM-dd HH:mm:ss" # timestamp parse pattern
+  # PERMISSIVE keeps malformed records (captured in the corrupt-record column) so
+  # the job can ROUTE + COUNT them to quarantine. DROPMALFORMED/FAILFAST prohibited.
+  mode: PERMISSIVE
+  column_name_of_corrupt_record: "_corrupt_record"
+
+# Ordered physical layout of the incoming flat file. MUST match the field names
+# AND order of schemas.staging_raw.STAGING_RAW exactly (types are defined there).
+expected_columns:
+  - gl_entry_id
+  - journal_id
+  - account_id
+  - posting_date
+  - amount
+  - currency_code
+  - debit_credit_indicator
+  - cost_center
+  - source_system
+  - load_ts
+
+bad_records:
+  threshold: 0.0                          # overridable; manifest defaults are authoritative
+  quarantine_subpath: "staging_raw"       # appended to manifest defaults.quarantine_prefix

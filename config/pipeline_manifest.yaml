@@ -1,0 +1,210 @@
+#
+# Copyright (2024) The Delta Lake Project Authors.
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+# http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# ---------------------------------------------------------------------------
+# Pipeline manifest for the `sp_chain_replacement` finance pipeline.
+#
+# Purpose
+#   THE authoritative, env-agnostic single source of truth for a config-driven,
+#   multi-stage AWS Glue 4.0 / PySpark + Delta Lake ETL pipeline that replaces a
+#   legacy finance SQL Server stored-procedure chain on a strict 1:1 basis. It
+#   declares the stored-procedure -> Glue-job mapping, stage order, per-table
+#   write modes, merge conditions, and the parity configuration used by Gate 1.
+#
+# Consumers (every one of these loads this file)
+#   - lib/manifest.py                 parses with PyYAML and exposes typed
+#                                     accessors over `stages`/`tables`.
+#   - jobs/stage_*.py                 each Glue job looks up its stage by `step`,
+#                                     resolves `reads`/`writes` tables, write
+#                                     modes, and merge conditions.
+#   - dags/sp_chain_replacement_dag.py  builds one GlueJobOperator per `stages[]`
+#                                     entry, chained sequentially with `>>` in
+#                                     ascending `stage` order.
+#   - infra/glue_jobs.tf              `yamldecode(file(...))` + `for_each` keyed
+#                                     on `step` to create one aws_glue_job/stage.
+#   - validate/ (Gate 1 parity)       iterates `tables[]` to compare each table
+#                                     to its legacy baseline by row count +
+#                                     5-field hash.
+#
+# Env-agnostic / no secrets (NON-NEGOTIABLE)
+#   This one file serves dev/nonprod/prod. It MUST NOT contain bucket names, AWS
+#   region, DynamoDB table name, account IDs, ARNs, credentials, or any secret.
+#   Those are injected at runtime via Glue job arguments and infra/envs/*.tfvars
+#   (secrets are resolved via IAM role assumption / parameter lookup, never in
+#   config). This manifest holds LOGICAL names + RELATIVE paths ONLY; absolute
+#   S3 URIs are composed at runtime as:
+#       s3a://${DELTA_S3_BUCKET}/${defaults.delta_path_prefix}/<table.path>
+#   Glue runtime/Spark wiring (glue_version, worker type, --extra-jars,
+#   --additional-python-modules, and the S3DynamoDBLogStore / DeltaSparkSession
+#   extension + DeltaCatalog Spark props) lives in infra/glue_jobs.tf and
+#   lib/spark_session.py -- intentionally NOT here. Authoritative column TYPES
+#   live in schemas/*.py (explicit StructType); this file references schemas only
+#   by module/symbol.
+# ---------------------------------------------------------------------------
+
+manifest_version: 1                     # shape version of THIS manifest; bump only on breaking changes
+
+pipeline: sp_chain_replacement          # logical id / file stem (underscores)
+
+naming:
+  domain: finance                       # PIPELINE_DOMAIN
+  pipeline_name: sp-chain-replacement   # AWS resource/MWAA-task token (hyphens)
+  resource_pattern: "{env}-{domain}-{pipeline_name}-{step}"  # env injected at runtime
+
+description: >-
+  1:1 PySpark/Delta replacement of the finance SQL Server stored-procedure chain,
+  orchestrated as sequential AWS Glue 4.0 jobs writing Delta tables on S3 via the
+  S3DynamoDBLogStore.
+
+schedule:
+  cron: "0 6 * * *"                     # daily 06:00 UTC (confirm cadence with platform team)
+  timezone: "UTC"
+  catchup: false
+
+defaults:
+  bad_record_threshold: 0.0             # fail job if bad-record rate exceeds this (Stage 0)
+  parity_threshold: 0.9999              # Gate 1: >= 99.99%
+  delta_path_prefix: "finance/sp_chain_replacement"            # RELATIVE root under DELTA_S3_BUCKET
+  quarantine_prefix: "quarantine/finance/sp_chain_replacement" # RELATIVE quarantine root
+  write_options:
+    mergeSchema: "false"                # schema safety: inference prohibited (string, not bool)
+
+source_contract: "config/sp_chain_replacement_source_contract.yaml"  # Stage 0 source contract (sibling)
+
+# Logical table catalog. `kind` in {staging, output}. `path` is RELATIVE under
+# defaults.delta_path_prefix. `schema.module`/`schema.symbol` point at the explicit
+# StructType in schemas/. Staging tables write `overwrite`; output tables write
+# `merge` or `overwrite` only (never `append`). Each `parity` block carries the
+# legacy baseline plus EXACTLY 5 hash_columns (the mandated 5-field hash, Gate 1).
+tables:
+  - name: staging_raw
+    kind: staging
+    path: "staging/staging_raw"
+    schema: { module: "schemas.staging_raw", symbol: "STAGING_RAW" }
+    write_mode: overwrite
+    parity:
+      baseline: "dbo.Staging_Raw"
+      key_columns: [gl_entry_id]
+      hash_columns: [gl_entry_id, account_id, posting_date, amount, currency_code]
+
+  - name: staging_1_cleansed
+    kind: staging
+    path: "staging/staging_1_cleansed"
+    schema: { module: "schemas.staging_tables", symbol: "STAGING_1_CLEANSED" }
+    write_mode: overwrite
+    parity:
+      baseline: "dbo.Staging_Cleansed"
+      key_columns: [gl_entry_id]
+      hash_columns: [gl_entry_id, account_id, posting_date, amount, currency_code]
+
+  - name: staging_2_enriched
+    kind: staging
+    path: "staging/staging_2_enriched"
+    schema: { module: "schemas.staging_tables", symbol: "STAGING_2_ENRICHED" }
+    write_mode: overwrite
+    parity:
+      baseline: "dbo.Staging_Enriched"
+      key_columns: [gl_entry_id]
+      hash_columns: [gl_entry_id, account_id, posting_date, amount, currency_code]
+
+  - name: staging_3_balances
+    kind: staging
+    path: "staging/staging_3_balances"
+    schema: { module: "schemas.staging_tables", symbol: "STAGING_3_BALANCES" }
+    write_mode: overwrite
+    parity:
+      baseline: "dbo.Staging_Balances"
+      key_columns: [account_id, posting_date]
+      hash_columns: [account_id, posting_date, balance_amount, currency_code, cost_center]
+
+  - name: fact_general_ledger
+    kind: output
+    path: "output/fact_general_ledger"
+    schema: { module: "schemas.output_tables", symbol: "FACT_GENERAL_LEDGER" }
+    write_mode: merge
+    merge:
+      keys: [gl_entry_id, posting_date]
+      condition: "t.gl_entry_id = s.gl_entry_id AND t.posting_date = s.posting_date"
+      when_matched: update_all
+      when_not_matched: insert_all
+    parity:
+      baseline: "dbo.FactGeneralLedger"
+      key_columns: [gl_entry_id, posting_date]
+      hash_columns: [gl_entry_id, account_id, posting_date, amount, currency_code]
+
+  - name: dim_account_snapshot
+    kind: output
+    path: "output/dim_account_snapshot"
+    schema: { module: "schemas.output_tables", symbol: "DIM_ACCOUNT_SNAPSHOT" }
+    write_mode: overwrite
+    parity:
+      baseline: "dbo.DimAccountSnapshot"
+      key_columns: [account_id]
+      hash_columns: [account_id, account_name, account_type, cost_center, currency_code]
+
+# Ordered, strictly sequential stage chain. N stored procedures map to stages
+# 1..N (here N=4); stage 0 is flat-file ingestion (replaces the Informatica
+# mapping; replaces_stored_procedure: null); the final stage is output. `step` is
+# the UNIQUE token (Terraform for_each key + MWAA task-id suffix). `job_script` is
+# the repo-relative Glue entrypoint. `reads`/`writes` are lists of tables[].name.
+stages:
+  - stage: 0
+    step: "stage-0-ingest"
+    type: ingest
+    job_script: "jobs/stage_0_ingest.py"
+    replaces_stored_procedure: null      # Informatica flat-file ingestion mapping (no SP)
+    reads: []                            # reads flat files from PIPELINE_SOURCE_S3_PREFIX
+    writes: [staging_raw]
+    bad_record_threshold: 0.0            # stage-level override of defaults.bad_record_threshold
+
+  - stage: 1
+    step: "stage-1-cleanse-transactions"
+    type: transform
+    job_script: "jobs/stage_1_cleanse_transactions.py"
+    replaces_stored_procedure: "dbo.usp_cleanse_transactions"
+    reads: [staging_raw]
+    writes: [staging_1_cleansed]
+
+  - stage: 2
+    step: "stage-2-enrich-accounts"
+    type: transform
+    job_script: "jobs/stage_2_enrich_accounts.py"
+    replaces_stored_procedure: "dbo.usp_enrich_accounts"
+    reads: [staging_1_cleansed]
+    writes: [staging_2_enriched]
+
+  - stage: 3
+    step: "stage-3-compute-balances"
+    type: transform
+    job_script: "jobs/stage_3_compute_balances.py"
+    replaces_stored_procedure: "dbo.usp_compute_balances"
+    reads: [staging_2_enriched]
+    writes: [staging_3_balances]
+
+  - stage: 4
+    step: "stage-n-output"
+    type: output
+    job_script: "jobs/stage_n_output.py"
+    replaces_stored_procedure: "dbo.usp_load_gl_outputs"
+    # Reads the ENTRY-GRAIN enriched detail (one row per gl_entry_id) so the
+    # entry-grain `fact_general_ledger` preserves the true (gl_entry_id,
+    # posting_date) merge key and per-entry `amount` -- it is NOT built from the
+    # aggregated `staging_3_balances` (account x date x currency x cost-center
+    # grain), which would force a synthetic key and risk merge-key collisions.
+    # The account-grain `dim_account_snapshot` is collapsed from this same
+    # authoritative enriched detail. `staging_3_balances` remains a Gate-1
+    # parity deliverable produced by stage 3; the output stage does not consume it.
+    reads: [staging_2_enriched]
+    writes: [fact_general_ledger, dim_account_snapshot]

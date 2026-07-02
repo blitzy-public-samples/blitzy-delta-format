@@ -1,0 +1,43 @@
+# ---------------------------------------------------------------------------
+# validate/ — dev/test dependencies for the parity (Gate 1) & security (Gate 5)
+# acceptance harness. Dev/test ONLY: does not affect the monorepo build or the
+# Glue runtime (Glue resolves delta-spark from ARTIFACT_S3_BUCKET).
+# Run: pytest validate/test_parity.py --env <env>
+# ---------------------------------------------------------------------------
+
+# Test runner (Gate 1 parity + Gate 5 security). Per AAP §0.3.1 pytest is "not
+# user-specified and could not be web-verified", so it is left as a lower-bound
+# constraint to confirm with the platform team — NOT a fabricated exact pin.
+# delta-spark==2.3.0 below remains the only authoritative == pin.
+pytest>=7.0.0
+
+# AWS SDK for Gate 5 (iam simulate-principal-policy, IAM policy fetch),
+# DynamoDB scan, and S3 _delta_log listing. Per AAP §0.3.1 boto3/botocore are
+# "Bundled in Glue + MWAA runtimes; runtime-provided" — their exact version is
+# NOT controlled by this dev/test harness, so a lower-bound constraint (not an
+# exact == pin) is the correct treatment and keeps the harness portable across
+# heterogeneous CI/runner base images. Confirm the exact pin with the platform
+# team. delta-spark==2.3.0 below remains the only authoritative == pin.
+boto3>=1.26.0
+
+# Delta Lake Python API (DeltaTable). AUTHORITATIVE exact pin per AAP §0.3.1 and
+# §0.3.3 (RESOLVED): 2.3.0 is the Delta line compatible with AWS Glue 4.0's
+# Apache Spark 3.3.x runtime. The delta-spark 2.3.0 wheel METADATA declares
+# Requires-Dist: pyspark (<3.4.0,>=3.3.0) — verified locally — and the official
+# Delta Lake compatibility matrix (https://docs.delta.io/releases/) pairs Delta
+# 2.3.x with Spark 3.3.x. (Delta 3.2.0 required pyspark >=3.5,<3.6 = Spark 3.5.x,
+# which AWS Glue 4.0 does not ship — the exact reason it was superseded here.)
+delta-spark==2.3.0
+
+# Apache Spark Python API used to read the deployed Delta output tables and
+# compute the 5-field parity hash.
+#
+# COMPATIBILITY (AAP §0.3.3, RESOLVED): pinned to the Spark 3.3.x line to match
+# both the AWS Glue 4.0 runtime AND delta-spark 2.3.0's own dependency pin
+# (pyspark <3.4.0,>=3.3.0). This aligns the local parity reader with the DEPLOYED
+# tables' runtime. The upper bound <3.4.0 ensures a stray Spark 3.4/3.5 wheel can
+# never be resolved (which would reintroduce the Delta/Spark version mismatch).
+pyspark>=3.3.0,<3.4.0
+
+# YAML parser for config/pipeline_manifest.yaml (table catalog + parity specs).
+pyyaml>=6.0
